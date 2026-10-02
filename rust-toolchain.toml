@@ -1,0 +1,6 @@
+# Match the toolchain that passed upstream v0.7.11 Rust Quality.
+# Re-evaluate this pin when synchronizing onto a new upstream release.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
