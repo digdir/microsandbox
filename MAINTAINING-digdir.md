@@ -28,6 +28,12 @@ fixed path and replace or extend upstream's:
   section again.
 - `.github/CODEOWNERS` replaces upstream's. Keep ours.
 
+## Rust toolchain
+
+When synchronizing, take the exact toolchain from a successful upstream Rust Quality run of the new release, update
+`rust-toolchain.toml`, and keep the Digdir workflows' formatting, Clippy and documentation checks in line with
+upstream's.
+
 ## Invariants
 
 - The version is `<upstream-version>-digdir.<n>` for every internal crate and in `Cargo.lock`, and `v<version>` tags

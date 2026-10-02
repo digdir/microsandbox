@@ -17,6 +17,11 @@ How to change this fork. How it is synchronized with upstream and how runtimes a
 - Follow upstream's coding standards in [AGENTS.md](AGENTS.md) and [DEVELOPMENT.md](DEVELOPMENT.md). Commits in this
   fork are not signed.
 
+## Rust toolchain
+
+`rust-toolchain.toml` pins the toolchain that upstream's Rust Quality job passed with for the release we build on.
+Cargo, pre-commit hooks, Digdir CI and runtime releases all use it; avoid `cargo +stable`, which bypasses the pin.
+
 ## Referencing upstream
 
 When a commit, pull request, issue or comment here mentions an upstream issue or pull request, GitHub adds a
