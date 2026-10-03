@@ -59,6 +59,7 @@ fn backend_paths_stay_bound_to_construction_directory() {
                 snapshots: Some("./snapshots".into()),
                 logs: Some("./logs".into()),
                 secrets: Some("./secrets".into()),
+                run: Some("./run".into()),
             },
             registries: RegistriesConfig {
                 ca_certs: Some("./cert.pem".into()),
