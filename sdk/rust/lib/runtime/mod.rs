@@ -46,3 +46,12 @@ pub use spawn::{SpawnMode, spawn_sandbox};
 pub fn agent_socket_path(name: &str) -> crate::MicrosandboxResult<std::path::PathBuf> {
     resolve_agent_socket_path(name)
 }
+
+/// Return whether both canonical Unix socket endpoints fit the host limit.
+#[cfg(unix)]
+pub fn run_directory_fits(run_dir: &std::path::Path) -> bool {
+    microsandbox_runtime::ipc::validate_socket_pair(
+        &microsandbox_runtime::ipc::canonical_agent_endpoint(run_dir, "x"),
+    )
+    .is_ok()
+}
