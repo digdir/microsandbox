@@ -38,4 +38,6 @@ security policy](https://github.com/digdir/.github/blob/main/SECURITY.md), not i
 
 ## License
 
-Microsandbox and the Digdir modifications are licensed under the Apache License 2.0 ([LICENSE](LICENSE)).
+Microsandbox and the Digdir modifications are licensed under the Apache License 2.0 ([LICENSE](LICENSE)). Each runtime
+release also publishes the license texts and third-party notices for what it contains, and the corresponding source of
+the bundled libkrunfw firmware.
