@@ -2,9 +2,9 @@ name: Test Platform (Digdir)
 
 # Digdir copy of upstream's reusable test-platform.yml at v0.7.4, called by
 # check-digdir.yml. Upstream's file stays unchanged and disabled. This copy
-# uses the pinned Rust toolchain and lets the caller decide whether to save
-# caches. Compare it with upstream's test-platform.yml on every
-# synchronization.
+# uses the pinned Rust toolchain, lets the caller decide whether to save
+# caches, and also runs the macOS system DNS resolver tests. Compare it with
+# upstream's test-platform.yml on every synchronization.
 
 on:
   workflow_call:
@@ -84,3 +84,10 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --exclude microsandbox-agentd
+
+      # The macOS resolver goes through mDNSResponder; these tests need the
+      # runner's network, so they are ignored in the workspace run above.
+      - name: Test macOS system DNS resolver
+        if: inputs.os == 'darwin'
+        run: |
+          cargo test -p microsandbox-network --lib dns::upstream::system::macos:: -- --include-ignored
