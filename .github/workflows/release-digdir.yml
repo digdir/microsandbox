@@ -442,6 +442,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
       - name: Download runtime artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -555,6 +558,68 @@ jobs:
             --max-version ${{ env.LINUX_GLIBC_BASELINE }} \
             release-artifacts
 
+      # The firmware is GPL-2.0 software, so its corresponding source is
+      # published with it, named by an immutable libkrunfw tag (see MAINTAINING-digdir.md).
+      - name: Resolve firmware source
+        id: firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(git -C vendor/libkrunfw rev-parse HEAD)
+          tag=$(git ls-remote --tags https://github.com/digdir/libkrunfw.git 'refs/tags/v*-digdir.*' \
+            | awk -v commit="${commit}" '$1 == commit { sub("refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2; exit }')
+          if [ -z "${tag}" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = push ]; then
+              echo "::error::libkrunfw commit ${commit} has no v*-digdir.* tag in digdir/libkrunfw; tag it before releasing"
+              exit 1
+            fi
+            echo "::warning::libkrunfw commit ${commit} has no v*-digdir.* tag yet; tag it before the release"
+            tag=${commit:0:12}
+          fi
+          kernel_version=$(awk '$1 == "KERNEL_VERSION" { print $3; exit }' vendor/libkrunfw/Makefile)
+          if [ -z "${kernel_version}" ]; then
+            echo "::error::vendor/libkrunfw/Makefile must define KERNEL_VERSION"
+            exit 1
+          fi
+          {
+            echo "commit=${commit}"
+            echo "tag=${tag}"
+            echo "kernel-version=${kernel_version}"
+          } >> "${GITHUB_OUTPUT}"
+
+      # Downloads the kernel tarball and verifies it against upstream's pinned
+      # checksum, as the kernel build jobs do.
+      - name: Fetch kernel source
+        uses: ./.github/actions/cache-libkrunfw-kernel
+
+      - name: Add firmware source
+        id: firmware-source
+        shell: bash
+        env:
+          FIRMWARE_TAG: ${{ steps.firmware.outputs.tag }}
+          KERNEL_VERSION: ${{ steps.firmware.outputs.kernel-version }}
+        run: |
+          set -euo pipefail
+          git -C vendor/libkrunfw archive --format=tar.gz --prefix="libkrunfw-${FIRMWARE_TAG}/" \
+            -o "${GITHUB_WORKSPACE}/release-artifacts/libkrunfw-source.tar.gz" HEAD
+          cp "vendor/libkrunfw/tarballs/${KERNEL_VERSION}.tar.gz" "release-artifacts/${KERNEL_VERSION}.tar.gz"
+          kernel_sha256=$(sha256sum "release-artifacts/${KERNEL_VERSION}.tar.gz" | cut -d ' ' -f 1)
+          echo "kernel-sha256=${kernel_sha256}" >> "${GITHUB_OUTPUT}"
+
+      - uses: ./.github/actions/pinned-rust-toolchain-digdir
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.2
+
+      - name: Add licenses and third-party notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp LICENSE release-artifacts/LICENSE
+          cp vendor/libkrunfw/LICENSE-GPL-2.0-only release-artifacts/LICENSE-libkrunfw-GPL-2.0-only
+          cp vendor/libkrunfw/LICENSE-LGPL-2.1-only release-artifacts/LICENSE-libkrunfw-LGPL-2.1-only
+          scripts/digdir/third-party-notices.sh release-artifacts/THIRD_PARTY_NOTICES.md
+
       - name: Generate checksums
         shell: bash
         run: |
@@ -562,12 +627,63 @@ jobs:
           (cd release-artifacts && sha256sum * > checksums.sha256)
           (cd release-artifacts && sha256sum --check --strict checksums.sha256)
 
+      - name: Upload release assets for inspection
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: release-artifacts/
+          compression-level: 0
+          retention-days: 7
+
+      # Manual runs write the notes too, to the job summary, so that the
+      # upstream base check below runs before a tag is spent.
+      - name: Write release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FIRMWARE_TAG: ${{ steps.firmware.outputs.tag }}
+          KERNEL_VERSION: ${{ steps.firmware.outputs.kernel-version }}
+          KERNEL_SHA256: ${{ steps.firmware-source.outputs.kernel-sha256 }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          upstream_tag="v${version%-digdir.*}"
+          upstream_commit=$(git ls-remote https://github.com/superradcompany/microsandbox.git \
+            "refs/tags/${upstream_tag}" "refs/tags/${upstream_tag}^{}" | awk 'END { print $1 }')
+          if [ -z "${upstream_commit}" ]; then
+            echo "::error::upstream release tag ${upstream_tag} not found"
+            exit 1
+          fi
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${upstream_commit}...${GITHUB_SHA}" --jq .status)
+          if [ "${status}" != ahead ]; then
+            echo "::error::${GITHUB_SHA} is not based on upstream ${upstream_tag} (${upstream_commit}): ${status}"
+            exit 1
+          fi
+          cat > release-notes.md <<EOF
+          Digdir build of Microsandbox ${GITHUB_REF_NAME#v}, built from ${GITHUB_SHA}.
+
+          - Modifications: [the Digdir changes](https://github.com/${GITHUB_REPOSITORY}/compare/${upstream_commit}...${GITHUB_SHA}) on top of upstream Microsandbox [${upstream_tag}](https://github.com/superradcompany/microsandbox/releases/tag/${upstream_tag}).
+          - Runtime: \`microsandbox-*.tar.gz\` host runtime bundles, libkrunfw libraries and guest agents for Linux, macOS and Windows.
+          - Firmware: libkrunfw [${FIRMWARE_TAG}](https://github.com/digdir/libkrunfw/tree/${FIRMWARE_TAG}) with ${KERNEL_VERSION} (SHA-256 \`${KERNEL_SHA256}\`).
+          - Licenses: Microsandbox is licensed under Apache-2.0 (\`LICENSE\`). \`THIRD_PARTY_NOTICES.md\` lists the bundled third-party components. The GPL-2.0 corresponding source of the firmware is attached as \`libkrunfw-source.tar.gz\` and \`${KERNEL_VERSION}.tar.gz\`.
+          - Checksums: \`checksums.sha256\`.
+          EOF
+          cat release-notes.md >> "${GITHUB_STEP_SUMMARY}"
+
+      # Immutable releases lock their assets on publication, so upload every
+      # asset to a draft first and publish it last. A draft left by a failed
+      # run is not immutable and is replaced. Manual runs stop before this.
       - name: Create GitHub release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --prerelease \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            release-artifacts/*
+          set -euo pipefail
+          if [ "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "${GITHUB_REF_NAME}" --yes
+          fi
+          gh release create "${GITHUB_REF_NAME}" --draft --prerelease \
+            --title "${GITHUB_REF_NAME}" --notes-file release-notes.md
+          gh release upload "${GITHUB_REF_NAME}" release-artifacts/*
+          gh release edit "${GITHUB_REF_NAME}" --draft=false

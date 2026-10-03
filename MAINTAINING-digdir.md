@@ -162,6 +162,9 @@ integration tests. Then:
 3. Tag the libkrunfw commit, as libkrunfw's MAINTAINING-digdir.md describes.
 4. Tag `v<version>`. The release workflow builds and publishes the runtime for Linux, macOS and Windows.
 
+The release also attaches the license texts, third-party notices and the firmware's corresponding source, and refuses
+to publish while the libkrunfw commit is untagged.
+
 A failed or partial release is not repaired; publish a new Digdir revision. After publishing, verify the checksums and
 the Linux glibc baseline, and record the bundle digests for consumers.
 
