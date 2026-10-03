@@ -521,7 +521,7 @@ impl LocalBackend {
             } else {
                 RootfsMaterialization::Layered
             };
-            let overrides = RegistryOptions {
+            let overrides = || RegistryOptions {
                 auth: config.registry_auth.clone(),
                 insecure: config.insecure,
                 ca_certs: config.ca_certs.clone(),
@@ -541,7 +541,7 @@ impl LocalBackend {
                     self.resolve_oci_image_for_create(
                         &reference,
                         config.spec.pull_policy,
-                        overrides,
+                        overrides(),
                         expected_snapshot_manifest_digest.as_deref(),
                         image_materialization,
                         progress,
@@ -552,6 +552,36 @@ impl LocalBackend {
 
             // Retain file ownership through insertion of the sandbox/rootfs catalog rows.
             image_operations.push(cache_operation);
+
+            // A flat root with patches rebuilds its tree from the per-layer EROFS images instead
+            // of the cached flat blob. A flat cache hit does not guarantee those layers: an
+            // imported prepared root publishes only the flat artifact. Fetch the missing layers
+            // rather than failing the patch build.
+            let pull_result = if patched_flat_root_lacks_layers(
+                &root_disk,
+                !config.spec.patches.is_empty(),
+                &GlobalCache::new_async(&self.cache_dir()).await?,
+                &pull_result.layer_diff_ids,
+            ) {
+                let layered = timing::measure(
+                    &timing_name,
+                    "patch_layer_resolution",
+                    self.resolve_oci_image_for_create(
+                        &reference,
+                        config.spec.pull_policy,
+                        overrides(),
+                        expected_snapshot_manifest_digest.as_deref(),
+                        RootfsMaterialization::Layered,
+                        None,
+                    ),
+                )
+                .await?;
+                image_operations.push(layered.cache_operation);
+                layered.pull_result
+            } else {
+                pull_result
+            };
+
             tracing::trace!(
                 target: timing::TARGET,
                 sandbox_name = %timing_name,
@@ -2172,6 +2202,18 @@ impl LocalBackend {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Whether a flat root with patches is missing per-layer EROFS images it rebuilds its tree from.
+fn patched_flat_root_lacks_layers(
+    root_disk: &RootDisk,
+    has_patches: bool,
+    cache: &GlobalCache,
+    layer_diff_ids: &[Digest],
+) -> bool {
+    matches!(root_disk, RootDisk::Flat { .. })
+        && has_patches
+        && !cache.all_layers_materialized(layer_diff_ids)
+}
 
 /// Repoint only extracted child-owned paths after same-filesystem publication.
 /// Disk headers use relative basenames, so moving the whole directory preserves
@@ -3808,5 +3850,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[test]
+    fn patched_flat_roots_fetch_missing_layers_only() {
+        use super::{Digest, GlobalCache, RootDisk, patched_flat_root_lacks_layers};
+
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let missing: Digest = format!("sha256:{}", "b".repeat(64)).parse().unwrap();
+        let flat = RootDisk::Flat {
+            size_mib: None,
+            fstype: None,
+            clone: Default::default(),
+        };
+        let managed = RootDisk::Managed { size_mib: None };
+
+        assert!(patched_flat_root_lacks_layers(
+            &flat,
+            true,
+            &cache,
+            &[missing.clone()]
+        ));
+        assert!(!patched_flat_root_lacks_layers(
+            &flat,
+            false,
+            &cache,
+            &[missing.clone()]
+        ));
+        assert!(!patched_flat_root_lacks_layers(
+            &managed,
+            true,
+            &cache,
+            &[missing]
+        ));
+        assert!(!patched_flat_root_lacks_layers(&flat, true, &cache, &[]));
     }
 }
