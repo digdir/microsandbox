@@ -70,6 +70,7 @@ fn resolve_from(config: &mut super::GlobalConfig, file: Option<&Path>) -> Micros
             ("paths.snapshots", &mut config.paths.snapshots),
             ("paths.logs", &mut config.paths.logs),
             ("paths.secrets", &mut config.paths.secrets),
+            ("paths.run", &mut config.paths.run),
             ("registries.ca_certs", &mut config.registries.ca_certs),
         ]
         .map(|(field, path)| (field, path.as_mut())),
@@ -125,6 +126,7 @@ pub(super) fn resolve_patch(
                 &mut config.paths.secrets,
                 &higher.paths.secrets,
             ),
+            ("paths.run", &mut config.paths.run, &higher.paths.run),
             (
                 "registries.ca_certs",
                 &mut config.registries.ca_certs,

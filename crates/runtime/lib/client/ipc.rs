@@ -1230,6 +1230,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn control_socket_boundary_validates_the_pair() {
+        let mut run_dir = PathBuf::from("/tmp");
+        while socket_path_fits(&RuntimeSocketPaths::new(&run_dir, "x").control) {
+            run_dir.push("a");
+        }
+        let paths = RuntimeSocketPaths::new(&run_dir, "x");
+        assert!(socket_path_fits(&paths.agent));
+        assert!(!socket_path_fits(&paths.control));
+        assert!(validate_socket_pair(&paths.agent).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn lifecycle_guard_remains_owned_by_an_inherited_descriptor() {
         use std::os::fd::FromRawFd;
 

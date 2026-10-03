@@ -476,6 +476,33 @@ mod tests {
     }
 
     #[test]
+    fn relative_run_directories_resolve_like_other_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("config.json");
+        std::fs::write(&user, r#"{"paths":{"run":"./run"}}"#).unwrap();
+
+        let config = BackendConfig::load_from(&user, None)
+            .unwrap()
+            .prepare_for_local_backend(Default::default())
+            .unwrap();
+        assert_eq!(
+            config.resolved_config().paths.run,
+            Some(dir.path().join("run"))
+        );
+
+        let config = BackendConfig::load_from(&user, None)
+            .unwrap()
+            .prepare_for_local_backend(
+                serde_json::from_str(r#"{"paths":{"run":"./builder-run"}}"#).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            config.resolved_config().paths.run,
+            Some(std::path::absolute("./builder-run").unwrap())
+        );
+    }
+
+    #[test]
     fn local_preparation_validates_after_later_layers_supply_referenced_profiles() {
         let user = serde_json::from_str(r#"{"sandbox_defaults":{"placement_profile":"latency"}}"#)
             .unwrap();
