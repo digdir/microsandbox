@@ -105,24 +105,17 @@ impl PassthroughFs {
         let moved = inodes
             .by_path
             .iter()
-            .filter(|(path, _)| {
-                path.as_path() == old_path
-                    || (self.cfg.owned_checkpoint.is_some() && path.starts_with(old_path))
-            })
+            .filter(|(path, _)| path.starts_with(old_path))
             .map(|(path, data)| (path.clone(), data.clone()))
             .collect::<Vec<_>>();
         for (path, data) in moved {
             inodes.by_path.remove(&path);
-            // Owned state records current child paths, including cached descendants of
-            // a renamed directory. An unrelated destination inode keeps its retained pin.
-            let path = new_path.join(path.strip_prefix(old_path).expect("selected descendant"));
+            // Cached descendants must follow directory renames on shared and owned mounts.
+            // An unrelated destination inode keeps its retained pin.
+            let path = renamed_inode_path(&path, old_path, new_path);
             let canonical = data.path();
             if canonical.starts_with(old_path) {
-                *data.path.write().unwrap() = new_path.join(
-                    canonical
-                        .strip_prefix(old_path)
-                        .expect("selected descendant"),
-                );
+                *data.path.write().unwrap() = renamed_inode_path(&canonical, old_path, new_path);
             }
             inodes.by_path.insert(path, data);
         }
@@ -133,5 +126,20 @@ impl PassthroughFs {
         if let Some(replaced) = replaced {
             self.reap_owned_inode(replaced.inode);
         }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn renamed_inode_path(path: &Path, old_path: &Path, new_path: &Path) -> PathBuf {
+    let suffix = path.strip_prefix(old_path).expect("selected descendant");
+    if suffix.as_os_str().is_empty() {
+        // Joining an empty suffix adds a trailing separator, which makes a file
+        // path unusable for subsequent Windows metadata and lookup operations.
+        new_path.to_path_buf()
+    } else {
+        new_path.join(suffix)
     }
 }

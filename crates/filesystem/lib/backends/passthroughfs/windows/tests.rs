@@ -638,37 +638,127 @@ fn readonly_rejects_mutation() {
 }
 
 #[test]
+fn shared_directory_rename_preserves_cached_descendants() {
+    let temp = TempDir::new();
+    std::fs::create_dir_all(temp.path.join("directory/inner")).unwrap();
+    std::fs::write(temp.path.join("directory/inner/file"), b"child").unwrap();
+    std::fs::create_dir(temp.path.join("directory-other")).unwrap();
+    std::fs::write(temp.path.join("directory-other/file"), b"neighbor").unwrap();
+    std::fs::create_dir(temp.path.join("destination")).unwrap();
+    let fs = fs_for(&temp.path);
+    assert!(fs.cfg.owned_checkpoint.is_none());
+    let directory = fs
+        .lookup(context(), ROOT_INODE, c"directory")
+        .unwrap()
+        .inode;
+    let inner = fs.lookup(context(), directory, c"inner").unwrap().inode;
+    let child = fs.lookup(context(), inner, c"file").unwrap().inode;
+    let neighbor_directory = fs
+        .lookup(context(), ROOT_INODE, c"directory-other")
+        .unwrap()
+        .inode;
+    let neighbor = fs
+        .lookup(context(), neighbor_directory, c"file")
+        .unwrap()
+        .inode;
+    let destination = fs
+        .lookup(context(), ROOT_INODE, c"destination")
+        .unwrap()
+        .inode;
+
+    for (old_parent, old_name, new_parent, new_name, host_directory) in [
+        (
+            ROOT_INODE,
+            c"directory",
+            destination,
+            c"moved",
+            "destination/moved",
+        ),
+        (destination, c"moved", ROOT_INODE, c"returned", "returned"),
+    ] {
+        fs.rename(context(), old_parent, old_name, new_parent, new_name, 0)
+            .unwrap();
+        assert_eq!(fs.getattr(context(), child, None).unwrap().0.st_size, 5);
+        let moved = fs.lookup(context(), new_parent, new_name).unwrap();
+        assert_eq!(moved.inode, directory);
+        assert_eq!(
+            fs.lookup(context(), moved.inode, c"inner").unwrap().inode,
+            inner
+        );
+        assert_eq!(fs.lookup(context(), inner, c"file").unwrap().inode, child);
+        let handle = fs.open(context(), child, false, 0).unwrap().0.unwrap();
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        fs.read(context(), child, handle, &mut writer, 32, 0, None, 0)
+            .unwrap();
+        assert_eq!(writer.bytes, b"child");
+        fs.release(context(), child, 0, handle, false, false, None)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(temp.path.join(host_directory).join("inner/file")).unwrap(),
+            b"child"
+        );
+        assert_eq!(
+            fs.lookup(context(), neighbor_directory, c"file")
+                .unwrap()
+                .inode,
+            neighbor
+        );
+        assert_eq!(fs.getattr(context(), neighbor, None).unwrap().0.st_size, 8);
+        assert_eq!(
+            std::fs::read(temp.path.join("directory-other/file")).unwrap(),
+            b"neighbor"
+        );
+        expect_errno(fs.lookup(context(), old_parent, old_name), LINUX_ENOENT);
+    }
+}
+
+#[test]
 fn heartbeat_style_rename_keeps_source_inode_usable() {
     let temp = TempDir::new();
     std::fs::write(temp.path.join("heartbeat.json"), b"old").unwrap();
-    std::fs::write(temp.path.join("heartbeat.tmp"), b"new").unwrap();
     let fs = fs_for(&temp.path);
+    fs.lookup(context(), ROOT_INODE, c"heartbeat.json").unwrap();
 
-    let source = fs.lookup(context(), ROOT_INODE, c"heartbeat.tmp").unwrap();
-    fs.rename(
-        context(),
-        ROOT_INODE,
-        c"heartbeat.tmp",
-        ROOT_INODE,
-        c"heartbeat.json",
-        0,
-    )
-    .unwrap();
+    for sequence in 1..=4 {
+        let bytes = format!(r#"{{"sequence":{sequence}}}"#).into_bytes();
+        std::fs::write(temp.path.join("heartbeat.tmp"), &bytes).unwrap();
+        let source = fs.lookup(context(), ROOT_INODE, c"heartbeat.tmp").unwrap();
+        fs.rename(
+            context(),
+            ROOT_INODE,
+            c"heartbeat.tmp",
+            ROOT_INODE,
+            c"heartbeat.json",
+            0,
+        )
+        .unwrap();
 
-    let (handle, _) = fs.open(context(), source.inode, false, 0).unwrap();
-    let mut writer = CaptureWriter { bytes: Vec::new() };
-    fs.read(
-        context(),
-        source.inode,
-        handle.unwrap(),
-        &mut writer,
-        3,
-        0,
-        None,
-        0,
-    )
-    .unwrap();
-    assert_eq!(writer.bytes, b"new");
+        let destination = fs.lookup(context(), ROOT_INODE, c"heartbeat.json").unwrap();
+        assert_eq!(destination.inode, source.inode);
+        let (handle, _) = fs.open(context(), source.inode, false, 0).unwrap();
+        let handle = handle.unwrap();
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        fs.read(
+            context(),
+            source.inode,
+            handle,
+            &mut writer,
+            bytes.len() as u32,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.bytes, bytes);
+        fs.release(context(), source.inode, 0, handle, false, false, None)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(temp.path.join("heartbeat.json")).unwrap(),
+            bytes
+        );
+        assert!(!temp.path.join("heartbeat.tmp").exists());
+    }
+    fs.unlink(context(), ROOT_INODE, c"heartbeat.json").unwrap();
 }
 
 #[test]
@@ -1834,6 +1924,28 @@ fn owned_rename_replacement_and_cached_descendants_survive_capture() {
             .st_size,
         5
     );
+    let moved = source.lookup(context(), ROOT_INODE, c"moved").unwrap();
+    assert_eq!(moved.inode, directory);
+    let moved_child = source.lookup(context(), moved.inode, c"file").unwrap();
+    assert_eq!(moved_child.inode, child_inode);
+    let target = source.lookup(context(), ROOT_INODE, c"target").unwrap();
+    let target_handle = source
+        .open(context(), target.inode, false, 0)
+        .unwrap()
+        .0
+        .unwrap();
+    assert_eq!(owned_read(&source, target.inode, target_handle), b"new");
+    source
+        .release(
+            context(),
+            target.inode,
+            0,
+            target_handle,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
     assert_eq!(owned_read(&source, old_inode, old_handle), b"old");
     let generation = temp.path.join("generation");
     checkpoint.prepare_capture(&generation).unwrap();
