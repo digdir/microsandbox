@@ -41,6 +41,22 @@ updates the Cargo workspace, `.gitmodules` and `Cargo.lock` to match. When synch
 modify/delete conflicts; it is idempotent. A conflict in the workspace member list needs a manual resolution. Add new
 upstream surfaces the fork does not ship to the script.
 
+## Digdir CI
+
+Upstream's workflow files stay unchanged and are disabled with `gh workflow disable <file>`. The Digdir workflows are:
+
+- `check-digdir.yml`: the checks, on pull requests and on demand. Caches are saved only in runs on `main-digdir`. It
+  includes upstream's KVM lanes from `check.yml`: the integration tests with their fixtures, and the CLI smoke tests.
+  Upstream runs them on a self-hosted runner; here they run on GitHub-hosted Linux runners, which expose KVM.
+- `test-platform-digdir.yml`: a copy of upstream's `test-platform.yml`, called by `check-digdir.yml`.
+- `release-digdir.yml`: a copy of upstream's release lanes. It publishes the runtime for a `v<version>` tag; a manual
+  run builds and validates everything without publishing.
+
+When synchronizing, compare upstream's release workflows, `test-platform.yml` and the KVM lanes in `check.yml` with the
+Digdir copies and adopt build and test changes. Disable new upstream workflows unless they are useful for our CI; remove
+a file GitHub cannot keep disabled, such as one it cannot parse, in the cleanup commit. The kernel tarball's checksum
+lives in upstream's `cache-libkrunfw-kernel` action.
+
 ## Invariants
 
 - The version is `<upstream-version>-digdir.<n>` for every internal crate and in `Cargo.lock`, and `v<version>` tags
