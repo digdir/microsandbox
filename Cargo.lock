@@ -4044,7 +4044,6 @@ version = "0.7.12"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "core-foundation 0.9.4",
  "crossbeam-queue",
  "futures",
  "hickory-net",
@@ -4071,7 +4070,6 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
- "system-configuration",
  "thiserror 2.0.21",
  "time",
  "tokio",
