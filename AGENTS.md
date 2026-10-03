@@ -354,3 +354,17 @@ git diff origin/main..HEAD --name-status
 - Do not edit generated artifacts, lockfiles, or submodule pointers unless the change requires it.
 - If generated files or lockfiles must change, explain why in the final summary.
 - Report what changed, what validation ran, and any checks that were skipped.
+
+## Digdir Fork
+
+This repository is the Digdir fork of microsandbox. Where the instructions above conflict with this section, this
+section applies.
+
+- Read [README.md](README.md) for what the fork changes, [CONTRIBUTING-digdir.md](CONTRIBUTING-digdir.md) for how
+  to change it, and [MAINTAINING-digdir.md](MAINTAINING-digdir.md) for how it is synchronized with upstream and
+  released.
+- The integration branch is `main-digdir`. Start contribution branches from it and compare against it, not `main`,
+  which only mirrors upstream.
+- Commits in this fork are not signed.
+- The Go, Node.js, Python and Ruby SDKs, their examples, the TypeScript packages, `mcp/` and `skills/` are removed in
+  this fork; ignore the parts of the project map, design principles and validation steps that refer to them.
