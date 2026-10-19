@@ -23,6 +23,7 @@ use smoltcp::wire::{
 };
 
 use crate::config::{ConnectionLimit, DnsConfig, PublishedPort, TcpAcceptQueueSize};
+use crate::control::NetworkControlClient;
 use crate::engine::dns::common::ports::DnsPortType;
 use crate::engine::dns::{
     interceptor::DnsInterceptor,
@@ -247,6 +248,7 @@ pub fn smoltcp_poll_loop(
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    controller: Option<NetworkControlClient>,
 ) {
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
@@ -284,6 +286,7 @@ pub fn smoltcp_poll_loop(
         config.gateway,
         config.gateway_mac,
         config.guest_mac,
+        controller.clone(),
     );
     let mut port_publisher = PortPublisher::new(
         &published_ports,
@@ -305,6 +308,7 @@ pub fn smoltcp_poll_loop(
         config.mtu,
         tokio_handle.clone(),
         outbound_proxy.clone(),
+        controller.clone(),
     );
     udp_relay.set_max_sessions(max_udp_connections.and_then(ConnectionLimit::cap));
     udp_relay.attach_dns_forwarder(dns_forwarder_handle.clone());
@@ -315,6 +319,7 @@ pub fn smoltcp_poll_loop(
         config.gateway_mac,
         config.guest_mac,
         tokio_handle.clone(),
+        controller.clone(),
     );
 
     // Rate-limit cleanup operations: run at most once per second.
@@ -590,7 +595,8 @@ pub fn smoltcp_poll_loop(
                     strict,
                     conn.proxy_connect,
                     connection_outbound_proxy,
-                );
+                )
+                .with_controller(controller.clone());
                 tokio_handle.spawn(proxy.run());
                 continue;
             }
@@ -665,7 +671,8 @@ pub fn smoltcp_poll_loop(
                 strict,
                 conn.proxy_connect,
                 connection_outbound_proxy,
-            );
+            )
+            .with_controller(controller.clone());
             tokio_handle.spawn(proxy.run());
         }
 
@@ -924,6 +931,14 @@ pub(crate) fn resolve_host_dst(dst: SocketAddr, gateway: GatewayIps) -> SocketAd
         }
         _ => dst,
     }
+}
+
+/// Whether the gateway-to-loopback rewrite turned `dst` into `resolved`, i.e.
+/// the flow is bound for the host through the gateway. The proxy tasks pass
+/// this to the host controller so it can authorize host-destined flows
+/// precisely instead of guessing which address ranges name the gateway.
+pub(crate) fn is_host_destined(dst: SocketAddr, resolved: SocketAddr) -> bool {
+    resolved.ip() != dst.ip() && resolved.ip().is_loopback()
 }
 
 /// Get the current time as a smoltcp [`Instant`] using a monotonic clock.
@@ -2056,6 +2071,7 @@ mod tests {
                 TcpAcceptQueueSize::DEFAULT,
                 handle,
                 SecretsHandle::new(Default::default()),
+                None,
                 None,
             );
         });
