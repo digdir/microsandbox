@@ -34,6 +34,13 @@ When synchronizing, take the exact toolchain from a successful upstream Rust Qua
 `rust-toolchain.toml`, and keep the Digdir workflows' formatting, Clippy and documentation checks in line with
 upstream's.
 
+## Removed upstream surfaces
+
+`scripts/digdir/remove-unshipped.sh` removes the upstream surfaces the fork does not ship, listed in its header, and
+updates the Cargo workspace, `.gitmodules` and `Cargo.lock` to match. When synchronizing, rerun it to resolve
+modify/delete conflicts; it is idempotent. A conflict in the workspace member list needs a manual resolution. Add new
+upstream surfaces the fork does not ship to the script.
+
 ## Invariants
 
 - The version is `<upstream-version>-digdir.<n>` for every internal crate and in `Cargo.lock`, and `v<version>` tags
