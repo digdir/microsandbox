@@ -46,8 +46,21 @@ pub struct ExecOptions {
     /// Allocate a PTY (pseudo-terminal).
     pub tty: bool,
 
+    /// Initial terminal dimensions when `tty` is enabled.
+    pub terminal_size: Option<TerminalSize>,
+
     /// Resource limits applied before exec via `setrlimit()`.
     pub rlimits: Vec<Rlimit>,
+}
+
+/// Dimensions of a pseudo-terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    /// Number of terminal rows.
+    pub rows: u16,
+
+    /// Number of terminal columns.
+    pub cols: u16,
 }
 
 /// Builder for [`ExecOptions`].
@@ -247,6 +260,12 @@ impl ExecOptionsBuilder {
     /// editors, `top`); disable for scripts and batch jobs (default: false).
     pub fn tty(mut self, enabled: bool) -> Self {
         self.options.tty = enabled;
+        self
+    }
+
+    /// Set the initial dimensions of the allocated pseudo-terminal.
+    pub fn terminal_size(mut self, rows: u16, cols: u16) -> Self {
+        self.options.terminal_size = Some(TerminalSize { rows, cols });
         self
     }
 
@@ -578,7 +597,7 @@ pub(crate) mod agent {
 
     use super::{
         ExecEvent, ExecHandle, ExecOptions, ExecOutput, ExecSink, ExitStatus, StdinMode,
-        StreamTimeout,
+        StreamTimeout, TerminalSize,
     };
 
     pub(crate) async fn exec_stream(
@@ -588,18 +607,6 @@ pub(crate) mod agent {
         cmd: String,
         opts: ExecOptions,
     ) -> MicrosandboxResult<ExecHandle> {
-        exec_stream_with_pty_size(backend, name, config, cmd, opts, 24, 80).await
-    }
-
-    pub(crate) async fn exec_stream_with_pty_size(
-        backend: &dyn crate::backend::Backend,
-        name: &str,
-        config: &SandboxConfig,
-        cmd: String,
-        opts: ExecOptions,
-        rows: u16,
-        cols: u16,
-    ) -> MicrosandboxResult<ExecHandle> {
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
         let ExecOptions {
             args,
@@ -608,9 +615,12 @@ pub(crate) mod agent {
             env,
             rlimits,
             tty,
+            terminal_size,
             stdin: stdin_mode,
             timeout,
         } = opts;
+        let TerminalSize { rows, cols } =
+            terminal_size.unwrap_or(TerminalSize { rows: 24, cols: 80 });
 
         // Validate before dispatch. Count execution time from request dispatch, but never
         // signal a pre-start correlation: older agents also require ExecStarted first.
