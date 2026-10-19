@@ -23,6 +23,9 @@ change has to be carried forward on each synchronization. The changes are the co
 upstream release tag, such as host-side authorization of sandbox network traffic, portable prepared root filesystems,
 fixes for Windows hosts and publishing the runtime from this repository.
 
+The fork also removes upstream surfaces it does not ship, such as the Go, Node.js, Python and Ruby SDKs. Upstream's
+`DEVELOPMENT.md` and `CONTRIBUTING.md` are kept unchanged, so they still refer to some of them.
+
 ## Contributing and maintenance
 
 [CONTRIBUTING-digdir.md](CONTRIBUTING-digdir.md) describes how to change the fork, and
