@@ -90,13 +90,13 @@ async fn database_identity_preserves_process_locks() {
     let path = root.path().join("database");
     let file = File::create(&path).unwrap();
     lock(&file).unwrap();
-    let identity = DatabaseIdentity::capture(&path).unwrap();
+    let identity = DatabaseIdentity::capture(&path).await.unwrap();
     child(&path, "locked").await;
     identity.verify().unwrap();
     child(&path, "locked").await;
     // A second backend/metrics reader can release its identity while another
     // SQLite connection in this process still owns locks on the same inode.
-    drop(DatabaseIdentity::capture(&path).unwrap());
+    drop(DatabaseIdentity::capture(&path).await.unwrap());
     child(&path, "locked").await;
     drop(identity);
     child(&path, "locked").await;

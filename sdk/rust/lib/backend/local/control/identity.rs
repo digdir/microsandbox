@@ -1,5 +1,6 @@
 //! OS identity without any new runtime handshake field or persisted schema.
 
+#[cfg(not(target_os = "macos"))]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -14,6 +15,8 @@ use std::path::{Path, PathBuf};
 #[cfg(not(any(target_os = "macos", windows)))]
 use microsandbox_control_client::ErrorKind;
 use microsandbox_control_client::{ClientError, ControlClientError, ControlClientResult};
+#[cfg(target_os = "macos")]
+use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{FILETIME, WAIT_TIMEOUT},
@@ -44,7 +47,13 @@ pub(in crate::backend::local) struct DatabaseIdentity {
     path: PathBuf,
     id: (u64, u64, u64),
     // Keep the original object alive so an unlinked inode/file ID cannot be
-    // recycled and mistaken for this backend's database.
+    // recycled and mistaken for this backend's database. macOS has no O_PATH,
+    // and closing any descriptor of the catalog releases every POSIX lock this
+    // process holds on it, so the inode is pinned through SQLite itself, which
+    // coordinates its closes with all other connections.
+    #[cfg(target_os = "macos")]
+    _connection: SqliteConnection,
+    #[cfg(not(target_os = "macos"))]
     _file: File,
 }
 
@@ -172,20 +181,62 @@ impl ProcessIdentity {
 }
 
 impl DatabaseIdentity {
-    pub fn capture(path: impl AsRef<Path>) -> ControlClientResult<Self> {
-        let file = open_database_identity(path.as_ref()).map_err(ClientError::from)?;
-        let id = file_id(&file)?;
-        Ok(Self {
-            path: path.as_ref().to_owned(),
-            id,
-            _file: file,
-        })
+    pub async fn capture(path: impl AsRef<Path>) -> ControlClientResult<Self> {
+        let path = path.as_ref();
+        #[cfg(target_os = "macos")]
+        {
+            let metadata = std::fs::metadata(path).map_err(ClientError::from)?;
+            let id = (metadata.dev(), metadata.ino(), 0);
+            let options = SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .create_if_missing(false);
+            let mut connection = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(database_lookup_error)?;
+            // Read the schema so SQLite opens and retains the catalog inode.
+            // No transaction remains open, so this does not hold a WAL reader
+            // snapshot or prevent checkpointing while the backend is alive.
+            sqlx::query("PRAGMA schema_version")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(database_lookup_error)?;
+            let identity = Self {
+                path: path.to_owned(),
+                id,
+                _connection: connection,
+            };
+            // Reject replacement across capture without a raw open/close.
+            identity.verify()?;
+            Ok(identity)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let file = open_database_identity(path).map_err(ClientError::from)?;
+            let id = file_id(&file)?;
+            Ok(Self {
+                path: path.to_owned(),
+                id,
+                _file: file,
+            })
+        }
     }
 
     pub fn verify(&self) -> ControlClientResult<()> {
-        let current =
-            open_database_identity(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
-        if file_id(&current)? != self.id {
+        #[cfg(target_os = "macos")]
+        let current_id = {
+            // stat() never closes a catalog descriptor or releases SQLite locks.
+            let metadata =
+                std::fs::metadata(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+            (metadata.dev(), metadata.ino(), 0)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let current_id = {
+            let current = open_database_identity(&self.path)
+                .map_err(|_| ControlClientError::RuntimeChanged)?;
+            file_id(&current)?
+        };
+        if current_id != self.id {
             return Err(ControlClientError::RuntimeChanged);
         }
         Ok(())
@@ -196,6 +247,7 @@ impl DatabaseIdentity {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(not(target_os = "macos"))]
 fn open_database_identity(path: &Path) -> std::io::Result<File> {
     #[cfg(target_os = "linux")]
     {
@@ -306,6 +358,12 @@ fn windows_start(handle: &OwnedHandle) -> ControlClientResult<ProcessStart> {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn database_lookup_error(error: sqlx::Error) -> ControlClientError {
+    ClientError::from(std::io::Error::other(error)).into()
+}
+
+#[cfg(not(target_os = "macos"))]
 fn file_id(file: &File) -> ControlClientResult<(u64, u64, u64)> {
     #[cfg(unix)]
     {
