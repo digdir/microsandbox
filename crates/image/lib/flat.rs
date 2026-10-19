@@ -9,6 +9,7 @@ use sha2::{Digest as Sha2Digest, Sha256};
 use crate::cache::lock::{flock_unlock, lock_exclusive, open_lock_file};
 use crate::erofs::{ErofsEntryKind, ErofsReader};
 use crate::ext4::{EXT4_ROOTFS_MATERIALIZER_ABI, Ext4RootfsOptions, materialize_ext4_rootfs};
+use crate::storage_lease::StorageLease;
 use crate::tree::{
     DataSpool, DeviceNode, DirectoryNode, FileData, FileTree, RegularFileId, RegularFileNode,
     SymlinkNode, TreeNode, merge_layers_with_provenance,
@@ -35,9 +36,10 @@ pub(crate) fn materialize_flat_rootfs(
 ) -> ImageResult<FlatRootfsRef> {
     let (derivation_digest, derivation_bytes) =
         flat_derivation_digest(manifest_digest, layer_diff_ids, platform);
-    if !force
-        && let Some(reference) = read_matching_flat_ref(cache, manifest_digest, &derivation_digest)?
-    {
+    // Hold the existing root through the caller's operation, as a cache hit does.
+    let (existing, _existing_lease) =
+        read_matching_flat_ref_leased(cache, manifest_digest, &derivation_digest)?;
+    if !force && let Some(reference) = existing {
         return Ok(reference);
     }
 
@@ -46,9 +48,10 @@ pub(crate) fn materialize_flat_rootfs(
     let _lock_guard = scopeguard::guard(lock_file, |file| {
         let _ = flock_unlock(&file);
     });
-    if !force
-        && let Some(reference) = read_matching_flat_ref(cache, manifest_digest, &derivation_digest)?
-    {
+    // Another publisher of this derivation may have replaced the ref while this one waited.
+    let (existing, _locked_lease) =
+        read_matching_flat_ref_leased(cache, manifest_digest, &derivation_digest)?;
+    if !force && let Some(reference) = existing {
         return Ok(reference);
     }
 
@@ -84,6 +87,8 @@ pub(crate) fn materialize_flat_rootfs(
     let artifact_digest: Digest = format!("sha256:{}", hex::encode(artifact.sha256))
         .parse()
         .map_err(|_| ImageError::ManifestParse("invalid flat artifact digest".to_string()))?;
+    // Publication may reuse an identical blob that interrupted image cleanup still journals.
+    let _blob_lease = cache.lease_paths(vec![cache.flat_blob_path(&artifact_digest)])?;
     cache.publish_flat_blob(&candidate, &artifact_digest, artifact.virtual_size_bytes)?;
 
     let reference = FlatRootfsRef {
@@ -97,7 +102,7 @@ pub(crate) fn materialize_flat_rootfs(
         inode_count: artifact.inode_count,
         content_bytes: artifact.content_bytes,
     };
-    cache.write_flat_ref(manifest_digest, &reference)?;
+    cache.replace_flat_ref(manifest_digest, &reference)?;
     Ok(reference)
 }
 
@@ -134,6 +139,42 @@ pub(crate) fn read_current_flat_ref(
 ) -> ImageResult<Option<FlatRootfsRef>> {
     let (derivation_digest, _) = flat_derivation_digest(manifest_digest, layer_diff_ids, platform);
     read_matching_flat_ref(cache, manifest_digest, &derivation_digest)
+}
+
+/// [`read_current_flat_ref`], holding leases on the reference and the blob it names.
+///
+/// Recovery of an interrupted image deletion admits each journaled entry on its own lease, so
+/// the reference's lease alone does not keep its blob. Call from blocking work.
+pub(crate) fn read_current_flat_ref_leased(
+    cache: &GlobalCache,
+    manifest_digest: &Digest,
+    layer_diff_ids: &[Digest],
+    platform: &Platform,
+) -> ImageResult<(Option<FlatRootfsRef>, Vec<StorageLease>)> {
+    let (derivation_digest, _) = flat_derivation_digest(manifest_digest, layer_diff_ids, platform);
+    read_matching_flat_ref_leased(cache, manifest_digest, &derivation_digest)
+}
+
+fn read_matching_flat_ref_leased(
+    cache: &GlobalCache,
+    manifest_digest: &Digest,
+    derivation_digest: &Digest,
+) -> ImageResult<(Option<FlatRootfsRef>, Vec<StorageLease>)> {
+    let mut leases = cache.lease_paths(vec![cache.flat_ref_path(manifest_digest)])?;
+    loop {
+        let Some(reference) = read_matching_flat_ref(cache, manifest_digest, derivation_digest)?
+        else {
+            return Ok((None, leases));
+        };
+        let artifact_digest: Digest = reference.artifact_digest.parse()?;
+        leases.extend(cache.lease_paths(vec![cache.flat_blob_path(&artifact_digest)])?);
+        // The blob may have been reclaimed, or the ref replaced, before the blob's lease.
+        if read_matching_flat_ref(cache, manifest_digest, derivation_digest)?.as_ref()
+            == Some(&reference)
+        {
+            return Ok((Some(reference), leases));
+        }
+    }
 }
 
 /// Validate both the complete derivation and the ABI explicitly. The ABI is
@@ -311,6 +352,43 @@ mod tests {
         assert_eq!(reference.content_bytes, b"flat-rootfs".len() as u64);
         assert_eq!(reference.inode_count, 3);
         assert_eq!(reference.virtual_size_bytes, 256 * 1024 * 1024);
+        assert!(cache.flat_blob_path(&artifact_digest).exists());
+        assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
+    }
+
+    #[test]
+    fn rematerializing_over_a_stale_ref_removes_the_blob_it_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let manifest: Digest = format!("sha256:{}", "d".repeat(64)).parse().unwrap();
+        let diff_id: Digest = format!("sha256:{}", "e".repeat(64)).parse().unwrap();
+        crate::erofs::write_erofs(&FileTree::new(), &cache.layer_erofs_path(&diff_id)).unwrap();
+        let stale_blob: Digest = format!("sha256:{}", "f".repeat(64)).parse().unwrap();
+        std::fs::write(cache.flat_blob_path(&stale_blob), [0u8; 8]).unwrap();
+        let stale = FlatRootfsRef {
+            schema: FLAT_REF_SCHEMA,
+            manifest_digest: manifest.to_string(),
+            derivation_digest: format!("sha256:{}", "0".repeat(64)),
+            artifact_digest: stale_blob.to_string(),
+            materializer_abi: EXT4_ROOTFS_MATERIALIZER_ABI.saturating_sub(1),
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 8,
+            inode_count: 1,
+            content_bytes: 0,
+        };
+        cache.write_flat_ref(&manifest, &stale).unwrap();
+
+        let reference = materialize_flat_rootfs(
+            &cache,
+            &manifest,
+            &[diff_id],
+            &Platform::host_linux(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!cache.flat_blob_path(&stale_blob).exists());
+        let artifact_digest: Digest = reference.artifact_digest.parse().unwrap();
         assert!(cache.flat_blob_path(&artifact_digest).exists());
         assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
     }

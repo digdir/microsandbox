@@ -267,11 +267,12 @@ async fn delete_batch(
                         continue;
                     }
                     let digest: Digest = manifest.digest.parse()?;
-                    if !admit(
-                        &mut cleanup,
-                        vec![cache.fsmeta_erofs_path(&digest), cache.vmdk_path(&digest)],
-                        &mut report,
-                    )? {
+                    let mut paths =
+                        vec![cache.fsmeta_erofs_path(&digest), cache.vmdk_path(&digest)];
+                    // The flat ref, and its blob unless a ref this batch keeps names it too.
+                    let deleting = cleanup.files.iter().cloned().collect();
+                    paths.extend(cache.flat_rootfs_paths(&digest, &deleting)?);
+                    if !admit(&mut cleanup, paths, &mut report)? {
                         continue;
                     }
                     manifest::Entity::delete_by_id(manifest.id)
@@ -388,7 +389,9 @@ mod tests {
 
     use super::*;
     use crate::Image;
-    use microsandbox_image::{CachedImageMetadata, CachedLayerMetadata, ImageConfig};
+    use microsandbox_image::{
+        CachedImageMetadata, CachedLayerMetadata, FlatRootfsRef, ImageConfig,
+    };
 
     async fn local(home: &std::path::Path) -> LocalBackend {
         crate::test_support::local_backend_builder(home)
@@ -430,6 +433,131 @@ mod tests {
             .await
             .unwrap();
         cache
+    }
+
+    /// Publish a flat ref for `metadata`'s manifest and the blob it names.
+    fn publish_flat(
+        cache: &GlobalCache,
+        metadata: &CachedImageMetadata,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let manifest: Digest = metadata.manifest_digest.parse().unwrap();
+        let artifact: Digest = format!("sha256:{}", "f".repeat(64)).parse().unwrap();
+        let blob = cache.flat_blob_path(&artifact);
+        std::fs::write(&blob, vec![1u8; 8192]).unwrap();
+        let reference = FlatRootfsRef {
+            schema: 1,
+            manifest_digest: metadata.manifest_digest.clone(),
+            derivation_digest: format!("sha256:{}", "e".repeat(64)),
+            artifact_digest: artifact.to_string(),
+            materializer_abi: 1,
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 8192,
+            inode_count: 2,
+            content_bytes: 0,
+        };
+        cache.write_flat_ref(&manifest, &reference).unwrap();
+        (cache.flat_ref_path(&manifest), blob)
+    }
+
+    /// A removal whose catalog transaction committed, but whose process died before it unlinked
+    /// the files it journaled.
+    async fn abandon_committed_removal(local: &LocalBackend, files: &[std::path::PathBuf]) {
+        drop(Journal::prepare(&local.cache_dir(), files).unwrap());
+        let db = local.db().await.unwrap();
+        image_ref::Entity::delete_many()
+            .exec(db.write())
+            .await
+            .unwrap();
+        manifest::Entity::delete_many()
+            .exec(db.write())
+            .await
+            .unwrap();
+        layer::Entity::delete_many().exec(db.write()).await.unwrap();
+    }
+
+    /// Rerun `test` in a child process, so that no forked sibling test retains its leases.
+    #[cfg(unix)]
+    fn run_isolated(test: &str, variable: &str) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(variable, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated {test} failed: {status}");
+    }
+
+    #[tokio::test]
+    async fn busy_flat_blob_is_skipped_by_normal_removal() {
+        #[cfg(unix)]
+        if std::env::var_os("MSB_TEST_BUSY_FLAT_BLOB").is_none() {
+            run_isolated(
+                "image::cleanup::tests::busy_flat_blob_is_skipped_by_normal_removal",
+                "MSB_TEST_BUSY_FLAT_BLOB",
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let local = local(home.path()).await;
+        let reference = "example.com/a:latest";
+        let metadata = metadata('a', 'c');
+        let cache = install(&local, reference, &metadata).await;
+        let (flat_ref, blob) = publish_flat(&cache, &metadata);
+        let operation = cache.operation();
+        operation.lease_paths(vec![blob.clone()]).unwrap();
+        // Removal untags the image but keeps the manifest whose flat root is busy.
+        let report = prune(&local).await.unwrap();
+        assert_eq!(report.image_refs_removed, 1);
+        assert_eq!(report.manifests_removed, 0);
+        assert_eq!(report.skipped_in_use, 1);
+        assert!(flat_ref.exists());
+        assert!(blob.exists());
+        drop(operation);
+        let report = prune(&local).await.unwrap();
+        assert_eq!(report.manifests_removed, 1);
+        assert!(!flat_ref.exists());
+        assert!(!blob.exists());
+    }
+
+    #[tokio::test]
+    async fn journal_recovery_keeps_a_leased_flat_root_until_it_is_released() {
+        #[cfg(unix)]
+        if std::env::var_os("MSB_TEST_JOURNALED_FLAT_ROOT").is_none() {
+            run_isolated(
+                "image::cleanup::tests::journal_recovery_keeps_a_leased_flat_root_until_it_is_released",
+                "MSB_TEST_JOURNALED_FLAT_ROOT",
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let local = local(home.path()).await;
+        let reference = "example.com/a:latest";
+        let metadata = metadata('a', 'c');
+        let cache = install(&local, reference, &metadata).await;
+        let (flat_ref, blob) = publish_flat(&cache, &metadata);
+        let files = [flat_ref.clone(), blob.clone()];
+        abandon_committed_removal(&local, &files).await;
+
+        // The image is imported again, reusing the files, before its catalog rows commit.
+        let operation = cache.operation();
+        operation.lease_paths(files.to_vec()).unwrap();
+        prune(&local).await.unwrap();
+        assert!(flat_ref.exists());
+        assert!(blob.exists());
+        Image::persist(&local, reference, metadata.clone())
+            .await
+            .unwrap();
+        drop(operation);
+        cleanup_journal::recover(&local).await.unwrap();
+        assert!(flat_ref.exists());
+        assert!(blob.exists());
+
+        // Without a publisher, recovery reclaims what the committed removal journaled.
+        abandon_committed_removal(&local, &files).await;
+        cleanup_journal::recover(&local).await.unwrap();
+        assert!(!flat_ref.exists());
+        assert!(!blob.exists());
     }
 
     #[tokio::test]

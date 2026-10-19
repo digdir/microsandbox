@@ -129,6 +129,10 @@ pub async fn export_prepared_root(
 ///
 /// The caller must authenticate the bundle's provenance through its transport. Import validates
 /// the bundle's internal image/root bindings and bytes, but does not rematerialize the OCI layers.
+///
+/// Import leases the root's flat ref and blob. Pass an operation scope from
+/// [`GlobalCache::operation`] and keep it until the catalog records the image, so that image
+/// cleanup cannot reclaim the root first.
 pub async fn import_prepared_root(
     cache: &GlobalCache,
     reference: &Reference,
@@ -165,6 +169,9 @@ fn import_prepared_root_blocking(
     let manifest_digest = parse_digest(&metadata.image.manifest_digest, "image manifest digest")?;
     let derivation_digest =
         parse_digest(&metadata.root.derivation_digest, "root derivation digest")?;
+    let artifact_digest = parse_digest(&metadata.root.artifact_digest, "flat artifact digest")?;
+    // Publication may reuse an identical blob that interrupted image cleanup still journals.
+    let _blob_lease = cache.lease_paths(vec![cache.flat_blob_path(&artifact_digest)])?;
     let lock_file = open_lock_file(&cache.flat_lock_path(&derivation_digest))?;
     lock_exclusive(&lock_file)?;
     let _lock_guard = scopeguard::guard(lock_file, |file| {
@@ -172,9 +179,13 @@ fn import_prepared_root_blocking(
     });
 
     let layer_diff_ids = layer_diff_ids(&metadata.image)?;
-    if crate::flat::read_current_flat_ref(cache, &manifest_digest, &layer_diff_ids, platform)?
-        .is_none()
-    {
+    let (existing, _existing_lease) = crate::flat::read_current_flat_ref_leased(
+        cache,
+        &manifest_digest,
+        &layer_diff_ids,
+        platform,
+    )?;
+    if existing.is_none() {
         let work_dir = cache.flat_work_dir(&derivation_digest);
         std::fs::create_dir_all(&work_dir).map_err(|source| cache_error(&work_dir, source))?;
         let _work_guard = scopeguard::guard(work_dir.clone(), |path| {
@@ -201,9 +212,8 @@ fn import_prepared_root_blocking(
                 "prepared root is not a valid ext4 artifact: {error}"
             ))
         })?;
-        let artifact_digest = parse_digest(&metadata.root.artifact_digest, "flat artifact digest")?;
         cache.publish_flat_blob(&candidate, &artifact_digest, actual_size)?;
-        cache.write_flat_ref(&manifest_digest, &metadata.root)?;
+        cache.replace_flat_ref(&manifest_digest, &metadata.root)?;
     }
 
     cache.write_image_metadata(reference, &metadata.image)?;
@@ -489,6 +499,7 @@ mod tests {
 
     use super::*;
     use crate::ext4::{Ext4RootfsOptions, materialize_ext4_rootfs};
+    use crate::storage_lease::StorageLease;
     use crate::tree::FileTree;
     use crate::{CachedImageMetadata, ImageConfig};
 
@@ -620,6 +631,23 @@ mod tests {
             artifact.virtual_size_bytes
         );
         validate_rootfs_image(&imported_blob).unwrap();
+
+        // Journal recovery admits a flat blob on its own lease, so the caller's operation
+        // retains both until the catalog records the import.
+        let leased_dir = tempdir().unwrap();
+        let leased_cache = GlobalCache::new(leased_dir.path()).unwrap();
+        for _ in 0..2 {
+            let operation = leased_cache.operation();
+            import_prepared_root(&operation, &reference, &platform, bundle_dir.path())
+                .await
+                .unwrap();
+            for path in [
+                leased_cache.flat_ref_path(&manifest_digest),
+                leased_cache.flat_blob_path(&artifact_digest),
+            ] {
+                assert!(StorageLease::try_exclusive(&path).unwrap().is_none());
+            }
+        }
 
         std::fs::write(
             bundle_dir.path().join(PREPARED_ROOT_PAYLOAD_FILENAME),
