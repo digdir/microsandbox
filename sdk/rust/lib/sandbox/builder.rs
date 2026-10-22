@@ -386,6 +386,23 @@ impl SandboxBuilder {
         self
     }
 
+    /// Expose hardware virtualization to the guest so it can run its own VMs through `/dev/kvm`.
+    ///
+    /// Supported on macOS hosts with an Apple M3 or newer chip and macOS 15 or newer, and on
+    /// Linux x86_64 hosts whose KVM module has nested virtualization enabled. Creating or
+    /// starting the sandbox fails on other hosts; `runtime::nested_virt_host_support` checks
+    /// first. `modify().nested_virt(..)` changes it for an existing sandbox.
+    ///
+    /// The guest can then reach the host hypervisor's nested virtualization support, which adds
+    /// to what code in the sandbox can attack on the host. Enable it only where VMs are needed.
+    ///
+    /// Full snapshots, forks, and full restores are refused while it is enabled. Disk-only
+    /// snapshots remain available, but a sandbox restored from one starts without nesting.
+    pub fn nested_virt(mut self, enabled: bool) -> Self {
+        self.config.spec.resources.nested_virt = Some(enabled);
+        self
+    }
+
     /// Restore a full snapshot using private copy-on-write memory.
     ///
     /// Clean pages can be shared by children; writes remain private. This requires
@@ -3439,6 +3456,20 @@ mod tests {
             Some(&"echo hi".into())
         );
         assert_eq!(config.spec.lifecycle.max_duration_secs, Some(60));
+    }
+
+    #[tokio::test]
+    async fn test_builder_sets_nested_virt() {
+        let build = |builder: SandboxBuilder| async { builder.build().await.unwrap() };
+        let default = build(SandboxBuilder::new("test").image("alpine")).await;
+        assert!(!default.spec.resources.nested_virt);
+        let enabled = build(
+            SandboxBuilder::new("test")
+                .image("alpine")
+                .nested_virt(true),
+        )
+        .await;
+        assert!(enabled.spec.resources.nested_virt);
     }
 
     #[tokio::test]

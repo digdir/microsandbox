@@ -179,6 +179,8 @@ impl PreviousLaunch {
             // Previous launch formats had no clock policy; they always synchronized.
             guest_clock: Default::default(),
             fs_state_limit_bytes: None,
+            // Previous launch generations predate nested virtualization.
+            nested_virt: false,
             memory_cache_dir: self.memory_cache_dir,
             block_writeback_limit_bytes: self.block_writeback_limit_bytes,
             block_writeback_pool_bytes: self.block_writeback_pool_bytes,

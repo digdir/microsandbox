@@ -1105,6 +1105,7 @@ impl Default for SandboxConfig {
                     cpu_placement: Default::default(),
                     placement_profile: None,
                     thp: TransparentHugePagePolicy::Madvise,
+                    nested_virt: false,
                 },
                 runtime: SandboxRuntimeOptions {
                     log_level: default_log_level(),
@@ -1938,6 +1939,7 @@ mod tests {
                 cpu_placement: Default::default(),
                 placement_profile: None,
                 thp: TransparentHugePagePolicy::Madvise,
+                nested_virt: false,
             },
             runtime: SandboxRuntimeOptions {
                 workdir: Some("/app".into()),
