@@ -336,6 +336,13 @@ pub async fn spawn_sandbox(
     launch_contract::validate_http_deny_response(&resolved_runtime.msb_path, config).await?;
     launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
     launch_contract::validate_fs_state_limit(&resolved_runtime.msb_path, global).await?;
+    launch_contract::validate_nested_virt(config, crate::error::Operation::SandboxStart)?;
+    launch_contract::validate_nested_virt_runtime(
+        &resolved_runtime.msb_path,
+        config,
+        crate::error::Operation::SandboxStart,
+    )
+    .await?;
     if config.checkpoint_restore.as_ref().is_some_and(|restore| {
         restore
             .external_mounts
@@ -2965,6 +2972,7 @@ fn machine_cli_args(
         thp: config.spec.resources.thp,
         guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
         fs_state_limit_bytes: local.config().fs_state_limit_override(),
+        nested_virt: config.spec.resources.nested_virt,
         memory_cache_dir: Some(local.cache_dir().join("memory")),
         startup: startup_command(config),
         lifecycle: Lifecycle {

@@ -270,6 +270,31 @@ msb create python:3.12 --name memory-worker --thp always
 
 Use `always` when the workload has large, densely touched anonymous allocations and memory bandwidth or TLB pressure matters. Keep `madvise` for general-purpose and high-density sandboxes. Use `never` for diagnostics or workloads that must avoid transparent huge pages entirely.
 
+## Nested virtualization
+
+Nested virtualization exposes hardware virtualization to the guest, which then has `/dev/kvm` and can run its own VMs, including microsandbox. It is off by default and is set per sandbox through the Rust SDK, when creating it or with `modify()`. Like the THP policy, it is persisted with the sandbox and applies on every start.
+
+```rust
+let sb = Sandbox::builder("sandbox-builder")
+    .image("debian:trixie")
+    .nested_virt(true)
+    .create()
+    .await?;
+
+// It is fixed at boot, so enabling it on a running sandbox restarts it.
+let existing = Sandbox::get("agent").await?;
+existing.modify().nested_virt(true).restart().apply().await?;
+```
+
+Without the setting, guests have no `/dev/kvm`. Creating, starting, or enabling it with `modify()` fails on hosts that cannot expose it, before an existing sandbox is replaced or changed. `microsandbox::runtime::nested_virt_host_support()` reports whether this host can expose it, and why not. Supported hosts are:
+
+- macOS with an Apple M3 or newer chip and macOS 15 or newer. The guest's kernel logs `Hyp nVHE mode initialized successfully`, and its own VMs cannot nest further.
+- Linux x86_64, when the `kvm_intel` or `kvm_amd` module has `nested` enabled.
+
+Full snapshots, forks, and full restores capture execution state, which does not cover the VMs a guest runs, so they are refused while nested virtualization is enabled. Disk-only snapshots remain available, but a sandbox restored from one starts without nested virtualization. VMs inside the guest pay extra overhead on every exit to the hypervisor, so their disk and device I/O are noticeably slower than the outer sandbox's. Only the Rust SDK exposes the setting.
+
+The guest can then reach the host hypervisor's nested virtualization support: KVM's nested VMX or SVM handling on Linux, and EL2 emulation in Hypervisor.framework on macOS. That adds to what code in the sandbox can attack on the host, so enable it only for sandboxes that need to run VMs.
+
 ## Custom init system
 
 By default the microsandbox agent runs as PID 1 inside the guest: small, fast, minimal. For workloads that expect a real init (systemd, OpenRC, s6, runit, etc.), `--init` hands PID 1 over to the init binary of your choice.

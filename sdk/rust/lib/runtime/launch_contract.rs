@@ -236,6 +236,9 @@ impl LaunchContract {
         if !launch.owned_volumes.is_empty() {
             return unsupported("sandbox-owned volumes");
         }
+        if launch.nested_virt {
+            return unsupported("nested virtualization");
+        }
         if self.patch < 16 && !launch.file_mounts.is_empty() {
             return unsupported("isolated file mounts");
         }
@@ -419,6 +422,7 @@ impl LaunchContract {
             placement_profile_name: resources.placement_profile.clone(),
             thp: resources.thp,
             guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
+            nested_virt: resources.nested_virt,
             vsock: config.spec.vsock.routes.clone(),
             owned_volumes: config
                 .spec
@@ -540,6 +544,7 @@ pub(crate) async fn validate_runtime_config(
     config: &SandboxConfig,
     global: &GlobalConfig,
 ) -> MicrosandboxResult<()> {
+    validate_nested_virt(config, crate::error::Operation::SandboxCreate)?;
     #[cfg(feature = "net")]
     let network = config.local_network_config()?;
     #[cfg(feature = "net")]
@@ -562,7 +567,60 @@ pub(crate) async fn validate_runtime_config(
         .await?;
     validate_guest_clock(&runtime.msb_path, config).await?;
     validate_fs_state_limit(&runtime.msb_path, global).await?;
+    validate_nested_virt_runtime(
+        &runtime.msb_path,
+        config,
+        crate::error::Operation::SandboxCreate,
+    )
+    .await?;
     Ok(())
+}
+
+/// Check that a sandbox modified to enable nested virtualization can start with it.
+/// Like other configuration edits, this does not require an installed runtime.
+pub(crate) async fn validate_nested_virt_change(
+    config: &SandboxConfig,
+    global: &GlobalConfig,
+) -> MicrosandboxResult<()> {
+    validate_nested_virt(config, crate::error::Operation::SandboxModify)?;
+    let runtime = match crate::setup::resolve_runtime(global) {
+        Ok(runtime) => runtime,
+        Err(MicrosandboxError::RuntimeNotInstalled(_)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_nested_virt_runtime(
+        &runtime.msb_path,
+        config,
+        crate::error::Operation::SandboxModify,
+    )
+    .await
+}
+
+/// Refuse nested virtualization where the host or the requested launch cannot honor it.
+pub(crate) fn validate_nested_virt(
+    config: &SandboxConfig,
+    operation: crate::error::Operation,
+) -> MicrosandboxResult<()> {
+    if !config.spec.resources.nested_virt {
+        return Ok(());
+    }
+    if config.checkpoint_restore.is_some() || config.branch_source.is_some() {
+        // Captures of nested guests are refused, so no restore source can carry one. Only create
+        // reaches this: stored configs never keep restore or branch markers.
+        return Err(MicrosandboxError::unsupported(
+            crate::error::Operation::SandboxCreate,
+            crate::error::UnsupportedReason::NotAvailable(
+                "full snapshot restores and forks are not supported with nested virtualization"
+                    .into(),
+            ),
+        ));
+    }
+    microsandbox_runtime::nested_virt::host_support().map_err(|reason| {
+        MicrosandboxError::unsupported(
+            operation,
+            crate::error::UnsupportedReason::NotAvailable(reason),
+        )
+    })
 }
 
 pub(crate) async fn resolve(path: &Path) -> MicrosandboxResult<LaunchContract> {
@@ -684,6 +742,32 @@ pub(crate) async fn validate_guest_clock(
         return Err(MicrosandboxError::unsupported(
             crate::error::Operation::SandboxStart,
             crate::error::UnsupportedReason::NotAvailable(upgrade_required("runtime.guest_clock")),
+        ));
+    }
+    Ok(())
+}
+
+/// Probe nested virtualization support only when the sandbox requests it.
+/// Runtimes that predate the capability would otherwise reject the launch field late.
+pub(crate) async fn validate_nested_virt_runtime(
+    path: &Path,
+    config: &SandboxConfig,
+    operation: crate::error::Operation,
+) -> MicrosandboxResult<()> {
+    if !config.spec.resources.nested_virt {
+        return Ok(());
+    }
+    let supported = bounded_probe(path, "__launch-protocol")
+        .await
+        .ok()
+        .and_then(|output| serde_json::from_slice::<LaunchCapabilities>(&output).ok())
+        .is_some_and(|capabilities| capabilities.nested_virt);
+    if !supported {
+        return Err(MicrosandboxError::unsupported(
+            operation,
+            crate::error::UnsupportedReason::NotAvailable(upgrade_required(
+                "resources.nested_virt",
+            )),
         ));
     }
     Ok(())
@@ -826,6 +910,7 @@ fn upgrade_required(feature: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Operation;
 
     #[test]
     fn symlinked_bind_roots_are_only_refused_from_the_enforcing_runtime() {
@@ -1158,6 +1243,52 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_virt_requires_an_explicit_runtime_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::fixtures::decode(include_str!(
+            "../db/fixtures/config-0.6.18.json"
+        ))
+        .unwrap();
+        // The default must avoid probing, including on an old runtime.
+        validate_nested_virt_runtime(
+            &dir.path().join("no-probe"),
+            &config,
+            Operation::SandboxStart,
+        )
+        .await
+        .unwrap();
+        config.spec.resources.nested_virt = true;
+        for response in [
+            "exit 1",
+            r#"printf '%s' '{"protocols":[2,1],"guest_clock":true}'"#,
+            r#"printf '%s' '{"protocols":[2,1],"nested_virt":false}'"#,
+            r#"printf '%s' '{"protocols":[2,1],"nested_virt":"true"}'"#,
+        ] {
+            let path = script(dir.path(), "unsupported-nested-virt", response);
+            let error = validate_nested_virt_runtime(&path, &config, Operation::SandboxModify)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                MicrosandboxError::Unsupported {
+                    op: Operation::SandboxModify,
+                    ..
+                }
+            ));
+            assert!(error.to_string().contains("resources.nested_virt"));
+        }
+        let path = script(
+            dir.path(),
+            "supports-nested-virt",
+            r#"printf '%s' '{"protocols":[2,1],"nested_virt":true}'"#,
+        );
+        validate_nested_virt_runtime(&path, &config, Operation::SandboxStart)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
@@ -1342,6 +1473,7 @@ mod tests {
 #[cfg(test)]
 mod encoding {
     use super::*;
+    use crate::error::Operation;
     use microsandbox_runtime::launch::LaunchConfig;
     use serde_json::{Value, json};
 
@@ -1376,6 +1508,67 @@ mod encoding {
         ))
         .unwrap();
         config.spec.network.secrets.unwrap()
+    }
+
+    #[tokio::test]
+    async fn nested_virt_restores_are_refused_before_runtime_resolution() {
+        let mut config = SandboxConfig::default();
+        config.spec.resources.nested_virt = true;
+        config.checkpoint_restore = Some(Default::default());
+        // Runs before the runtime lookup, so a replace target is never removed first.
+        let error = validate_runtime_config(&config, &GlobalConfig::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MicrosandboxError::Unsupported { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("nested virtualization"),
+            "{error}"
+        );
+
+        config.checkpoint_restore = None;
+        match (
+            validate_nested_virt(&config, Operation::SandboxCreate),
+            microsandbox_runtime::nested_virt::host_support(),
+        ) {
+            (Ok(()), Ok(())) => {}
+            (Err(MicrosandboxError::Unsupported { op, .. }), Err(_)) => {
+                assert_eq!(op, Operation::SandboxCreate);
+            }
+            (result, host) => panic!("validation {result:?} disagrees with host support {host:?}"),
+        }
+        config.spec.resources.nested_virt = false;
+        config.checkpoint_restore = Some(Default::default());
+        validate_nested_virt(&config, Operation::SandboxCreate).unwrap();
+    }
+
+    #[test]
+    fn nested_virt_is_sent_only_when_enabled_and_refused_by_previous_runtimes() {
+        let current = LaunchContract {
+            patch: 18,
+            machine: true,
+        };
+        let disabled = current.encode(&LaunchConfig::default()).unwrap();
+        assert!(disabled.get("nested_virt").is_none());
+
+        let launch = LaunchConfig {
+            nested_virt: true,
+            ..Default::default()
+        };
+        assert_eq!(current.encode(&launch).unwrap()["nested_virt"], json!(true));
+
+        let error = LaunchContract {
+            patch: 18,
+            machine: false,
+        }
+        .encode(&launch)
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("nested virtualization"),
+            "{error}"
+        );
     }
 
     #[cfg(feature = "net")]

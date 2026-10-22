@@ -75,6 +75,7 @@ pub(crate) struct CheckpointCoordinator {
     boot_geometry: (u8, u8, u32, u32),
     guest_clock: microsandbox_types::GuestClockPolicy,
     device_state_codec: msb_krun::DeviceStateCodec,
+    nested_virt: bool,
 }
 
 /// Published checkpoint identity returned to the control executor.
@@ -493,6 +494,7 @@ impl CheckpointCoordinator {
             device_state_codec: msb_krun::DeviceStateCodec::new(
                 msb_krun::DeviceStateLimits::default().with_fs_state_limit(vm.fs_state_limit()),
             ),
+            nested_virt: vm.nested_virt,
         })
     }
 
@@ -775,6 +777,7 @@ impl CheckpointCoordinator {
         record_integrity: bool,
         guest_flush: Option<microsandbox_types::GuestFlush>,
     ) -> Result<CheckpointResult, CheckpointFailure> {
+        validate_nested_capture(self.nested_virt).map_err(CheckpointFailure::before_pause)?;
         // All RAM captures pass through this executor-owned method. Consume the construction
         // handoff before either durable or local capture can publish a newer token. Dirty
         // tracking has run since the pristine mapping was installed, not since this adoption.
@@ -2233,6 +2236,17 @@ fn admit_resources(
     })
 }
 
+/// Refuses execution-state capture of a guest that can run its own VMs.
+fn validate_nested_capture(nested_virt: bool) -> Result<(), &'static str> {
+    if nested_virt {
+        // The VMM does not capture the state of VMs the guest runs, so a restore would corrupt them.
+        return Err(
+            "execution-state capture is not supported with nested virtualization; use a disk-only snapshot",
+        );
+    }
+    Ok(())
+}
+
 /// Require the guest-side generation driver before producing a checkpoint that promises full restore.
 ///
 /// Merely attaching the host transport is insufficient: without a bound guest driver, a restored
@@ -2569,7 +2583,7 @@ mod tests {
     use super::{
         FrozenWorkload, MemoryObjectSink, PendingDeviceState, WorkloadControl, overlay_extents,
         persist_device_states, publish_root_last, runtime_owned_fs_bindings,
-        validate_vm_generation_state, validate_workload_reply,
+        validate_nested_capture, validate_vm_generation_state, validate_workload_reply,
     };
     use std::collections::BTreeSet;
 
@@ -2584,6 +2598,13 @@ mod tests {
     use microsandbox_protocol::message::{Message, MessageType};
     use msb_krun::{GuestMemoryRange, MemoryCaptureSink};
     use std::sync::Arc;
+
+    #[test]
+    fn nested_guests_refuse_execution_state_capture() {
+        assert!(validate_nested_capture(false).is_ok());
+        let error = validate_nested_capture(true).unwrap_err();
+        assert!(error.contains("disk-only snapshot"), "{error}");
+    }
 
     #[test]
     fn block_writeback_follows_policy_without_weakening_directory_barriers() {

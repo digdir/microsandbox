@@ -47,6 +47,11 @@ pub struct SandboxModificationPatch {
     #[serde(alias = "oci_upper_size_mib", skip_serializing_if = "Option::is_none")]
     pub root_disk_size_mib: Option<u32>,
 
+    /// Whether the guest sees hardware virtualization. Fixed at boot, so it
+    /// takes effect on the next start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_virt: Option<bool>,
+
     /// Environment variables to set for future execs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvVar>,

@@ -648,7 +648,7 @@ for r in &plan.resize_status {
 
 </Accordion>
 
-Plan or apply a configuration change. Set what to change (CPUs, memory, env vars, labels, workdir, secrets), then call [`dry_run()`](#modification-dry_run) to preview or [`apply()`](#modification-apply) to commit. Both return a [`SandboxModificationPlan`](#sandboxmodificationplan) labeling each change `live`, `next start`, `requires restart`, or `unsupported`. Apply is all-or-nothing.
+Plan or apply a configuration change. Set what to change (CPUs, memory, env vars, labels, workdir, secrets, nested virtualization), then call [`dry_run()`](#modification-dry_run) to preview or [`apply()`](#modification-apply) to commit. Both return a [`SandboxModificationPlan`](#sandboxmodificationplan) labeling each change `live`, `next start`, `requires restart`, or `unsupported`. Apply is all-or-nothing.
 
 CPU and memory resize live within the [`max_cpus`](#modification-max_cpus) / [`max_memory`](#modification-max_memory) ceilings; raising a ceiling requires a restart. Env and workdir changes affect future execs only. On a stopped sandbox, changes are saved for the next boot.
 
@@ -1464,6 +1464,25 @@ Control whether the sandbox clock follows the host. Full snapshots save this set
   </div>
 </div>
 
+#### <span className="msb-recv">sandbox.</span><span className="msb-hn">nested_virt()</span>
+
+<Tooltip tip="Not accepted on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn nested_virt(self, enabled: bool) -> Self
+```
+
+Expose hardware virtualization to the guest, so it has `/dev/kvm` and can run its own VMs. Default: off. Creating or starting the sandbox fails on hosts that cannot expose it; `microsandbox::runtime::nested_virt_host_support()` checks first. Full snapshots, forks, and full restores are refused while it is on. See [nested virtualization](/sandboxes/bootstrap#nested-virtualization) for supported hosts and the security trade-off.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>enabled</code><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc">Whether the guest sees hardware virtualization.</div>
+  </div>
+</div>
+
 #### <span className="msb-recv">sandbox.</span><span className="msb-hn">intercept_tls()</span>
 
 ```rust
@@ -2275,6 +2294,25 @@ Set the desired boot-time maximum hotpluggable memory in MiB. Same as [`max_memo
   <div className="msb-param">
     <div className="msb-param-key"><code>max_memory_mib</code><span className="msb-type">u32</span></div>
     <div className="msb-param-desc">Maximum memory in MiB.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">modification.</span><span className="msb-hn">nested_virt()</span>
+
+<Tooltip tip="modify is not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn nested_virt(self, enabled: bool) -> Self
+```
+
+Expose or hide hardware virtualization in the guest, like [`nested_virt()`](#sandbox-nested_virt) on the builder. It is fixed at boot, so this is always restart-backed on a running sandbox. Enabling it fails before anything is stopped or saved when the host or runtime cannot honor it; disabling it always works.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>enabled</code><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc">Whether the guest sees hardware virtualization.</div>
   </div>
 </div>
 

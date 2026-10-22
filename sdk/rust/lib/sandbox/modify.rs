@@ -57,6 +57,9 @@ const ROOT_DISK_FIELD: &str = "root_disk_size";
 const ENV_FIELD: &str = "env";
 const LABEL_FIELD: &str = "label";
 const WORKDIR_FIELD: &str = "workdir";
+const NESTED_VIRT_FIELD: &str = "nested_virt";
+const NESTED_VIRT_REQUIRES_RESTART: &str =
+    "nested virtualization is fixed at boot; use restart or next_start";
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -165,6 +168,16 @@ impl SandboxModificationBuilder {
     /// user-owned disk images cannot be resized through this API.
     pub fn root_disk_size(mut self, size: impl Into<Mebibytes>) -> Self {
         self.patch.root_disk_size_mib = Some(size.into().as_u32());
+        self
+    }
+
+    /// Expose or hide hardware virtualization in the guest, like
+    /// [`SandboxBuilder::nested_virt`](super::SandboxBuilder::nested_virt).
+    ///
+    /// The setting is fixed at boot, so a running sandbox needs `restart` or `next_start`.
+    /// Enabling it fails before anything changes when the host or runtime cannot honor it.
+    pub fn nested_virt(mut self, enabled: bool) -> Self {
+        self.patch.nested_virt = Some(enabled);
         self
     }
 
@@ -331,6 +344,17 @@ impl SandboxModificationBuilder {
             apply_patch_to_config(&mut prospective, &self.patch);
             apply_secret_patch_to_config(&mut prospective, &self.patch)?;
             serde_json::to_string(&prospective)?;
+            // Refuse a setting the next start would reject before stopping or persisting anything.
+            if prospective.spec.resources.nested_virt && !config.spec.resources.nested_virt {
+                let local_backend = self.backend.as_local().ok_or_else(|| {
+                    crate::MicrosandboxError::local_only(Operation::SandboxModify)
+                })?;
+                crate::runtime::launch_contract::validate_nested_virt_change(
+                    &prospective,
+                    local_backend.config(),
+                )
+                .await?;
+            }
         }
         let restart_required = plan_requires_restart(&plan) && running_status(status);
         if restart_required {
@@ -586,6 +610,19 @@ fn build_plan(
         &mut warnings,
     );
     push_root_disk_size_change(status, config, &patch, policy, &mut changes);
+    if let Some(enabled) = patch.nested_virt
+        && enabled != config.spec.resources.nested_virt
+    {
+        changes.push(spec_change(
+            NESTED_VIRT_FIELD,
+            ChangeKind::Updated,
+            Some(config.spec.resources.nested_virt.to_string()),
+            Some(enabled.to_string()),
+            status,
+            policy,
+            NESTED_VIRT_REQUIRES_RESTART,
+        ));
+    }
     if live.root_disk_grow
         && running_status(status)
         && policy == ModificationPolicy::NoRestart
@@ -1262,6 +1299,9 @@ fn apply_patch_to_config(config: &mut SandboxConfig, patch: &SandboxModification
     }
     if config.spec.resources.max_memory_mib < config.spec.resources.memory_mib {
         config.spec.resources.max_memory_mib = config.spec.resources.memory_mib;
+    }
+    if let Some(enabled) = patch.nested_virt {
+        config.spec.resources.nested_virt = enabled;
     }
     if let Some(size_mib) = patch.root_disk_size_mib
         && let RootfsSource::Oci(oci) = &mut config.spec.image
@@ -3747,6 +3787,153 @@ mod tests {
             assert_eq!(change.disposition, ModificationDisposition::NextStart);
             assert!(change.reason.is_none());
         }
+    }
+
+    #[test]
+    fn nested_virt_changes_apply_at_boot() {
+        let patch = SandboxModificationPatch {
+            nested_virt: Some(true),
+            ..SandboxModificationPatch::default()
+        };
+        let plan_for = |status, policy| {
+            let plan = build_plan(
+                "api".to_string(),
+                status,
+                &config(2, 1024),
+                None,
+                LiveControl::default(),
+                patch.clone(),
+                policy,
+            );
+            let [PlannedChange::Config(change)] = plan.changes.as_slice() else {
+                panic!("expected one config change: {:?}", plan.changes);
+            };
+            assert_eq!(change.field, NESTED_VIRT_FIELD);
+            assert_eq!(change.before.as_deref(), Some("false"));
+            assert_eq!(change.after.as_deref(), Some("true"));
+            (change.disposition, change.reason.clone())
+        };
+
+        assert_eq!(
+            plan_for(SandboxStatus::Stopped, ModificationPolicy::NoRestart),
+            (ModificationDisposition::NextStart, None)
+        );
+        assert_eq!(
+            plan_for(SandboxStatus::Running, ModificationPolicy::NextStart),
+            (ModificationDisposition::NextStart, None)
+        );
+        assert_eq!(
+            plan_for(SandboxStatus::Running, ModificationPolicy::NoRestart),
+            (
+                ModificationDisposition::RequiresRestart,
+                Some(NESTED_VIRT_REQUIRES_RESTART.to_string())
+            )
+        );
+
+        // Requesting the current value plans nothing.
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config(2, 1024),
+            None,
+            LiveControl::default(),
+            SandboxModificationPatch {
+                nested_virt: Some(false),
+                ..SandboxModificationPatch::default()
+            },
+            ModificationPolicy::NoRestart,
+        );
+        assert!(plan.changes.is_empty());
+
+        let mut updated = config(2, 1024);
+        apply_patch_to_config(&mut updated, &patch);
+        assert!(updated.spec.resources.nested_virt);
+    }
+
+    #[tokio::test]
+    async fn applying_nested_virt_checks_the_host_before_persisting() {
+        let temp = tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .config_path(temp.path().join("config.json"))
+                .managed_config_path(temp.path().join("managed.json"))
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.as_local().unwrap().db().await.unwrap();
+        let current = config(2, 1024);
+        let model = sandbox_entity::ActiveModel {
+            name: Set(current.spec.name.clone()),
+            config: Set(serde_json::to_string(&current).unwrap()),
+            active_config: Set(None),
+            status: Set(SandboxStatus::Stopped),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(pools.write())
+        .await
+        .unwrap();
+        let saved = || async {
+            let row = sandbox_entity::Entity::find_by_id(model.id)
+                .one(pools.read())
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<SandboxConfig>(&row.config)
+                .unwrap()
+                .spec
+                .resources
+                .nested_virt
+        };
+
+        let enabled = SandboxModificationBuilder::new(backend.clone(), &current.spec.name)
+            .nested_virt(true)
+            .apply()
+            .await;
+        match microsandbox_runtime::nested_virt::host_support() {
+            Ok(()) => {
+                assert!(enabled.unwrap().applied);
+                assert!(saved().await);
+            }
+            Err(reason) => {
+                let error = enabled.unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        crate::MicrosandboxError::Unsupported {
+                            op: Operation::SandboxModify,
+                            ..
+                        }
+                    ),
+                    "{error}"
+                );
+                assert!(error.to_string().contains(&reason), "{error}");
+                assert!(!saved().await, "a refused change must not be persisted");
+                // Persist it directly, as on a host that lost support after creation.
+                let mut nested = current.clone();
+                nested.spec.resources.nested_virt = true;
+                sandbox_entity::Entity::update_many()
+                    .col_expr(
+                        sandbox_entity::Column::Config,
+                        Expr::value(serde_json::to_string(&nested).unwrap()),
+                    )
+                    .filter(sandbox_entity::Column::Id.eq(model.id))
+                    .exec(pools.write())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Disabling needs no host support, so a host that lost it can still recover.
+        let disabled = SandboxModificationBuilder::new(backend.clone(), &current.spec.name)
+            .nested_virt(false)
+            .apply()
+            .await
+            .unwrap();
+        assert!(disabled.applied);
+        assert!(!saved().await);
     }
 
     #[test]

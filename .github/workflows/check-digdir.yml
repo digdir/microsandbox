@@ -543,6 +543,16 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           test -r /dev/kvm && test -w /dev/kvm
 
+      # The nested virtualization test checks only the refusal where the runner lacks nested KVM,
+      # and fails where the runner has it but the host check refuses it.
+      - name: Report nested KVM
+        run: |
+          parameters=(/sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested)
+          grep -H . "${parameters[@]}" || true
+          if grep -sqxE 'Y|y|1' "${parameters[@]}"; then
+            echo "MSB_TEST_EXPECT_NESTED_VIRT=1" >> "$GITHUB_ENV"
+          fi
+
       - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2
         with:
           tool: cargo-nextest@0.9.143

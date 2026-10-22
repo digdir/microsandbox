@@ -23,6 +23,7 @@ pub(crate) mod spawn;
 //--------------------------------------------------------------------------------------------------
 
 pub use handle::ProcessHandle;
+pub use microsandbox_runtime::nested_virt::host_support as nested_virt_host_support;
 pub use spawn::{SpawnMode, spawn_sandbox};
 pub(crate) use spawn::{
     acquire_sandbox_lifecycle_guard, ensure_named_volumes, remove_sandbox_socket_artifacts_at,

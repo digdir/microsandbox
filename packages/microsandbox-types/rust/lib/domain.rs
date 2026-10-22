@@ -1005,6 +1005,10 @@ pub struct SandboxResources {
     /// Guest transparent huge-page policy selected at boot.
     #[serde(default, skip_serializing_if = "TransparentHugePagePolicy::is_madvise")]
     pub thp: TransparentHugePagePolicy,
+
+    /// Expose hardware virtualization to the guest so it can run its own VMs through `/dev/kvm`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested_virt: bool,
 }
 
 /// Controls how Microsandbox places vCPU threads on host processors.
@@ -1808,6 +1812,7 @@ impl Default for SandboxResources {
             cpu_placement: CpuPlacement::Inherit,
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
+            nested_virt: false,
         }
     }
 }
@@ -1831,6 +1836,8 @@ impl<'de> Deserialize<'de> for SandboxResources {
             placement_profile: Option<String>,
             #[serde(default)]
             thp: TransparentHugePagePolicy,
+            #[serde(default)]
+            nested_virt: bool,
         }
 
         let raw = RawResources::deserialize(deserializer)?;
@@ -1845,6 +1852,7 @@ impl<'de> Deserialize<'de> for SandboxResources {
             cpu_placement: raw.cpu_placement,
             placement_profile: raw.placement_profile,
             thp: raw.thp,
+            nested_virt: raw.nested_virt,
         })
     }
 }
@@ -3538,6 +3546,23 @@ mod tests {
                 "max_memory_mib": 2048
             })
         );
+    }
+
+    #[test]
+    fn nested_virt_is_omitted_when_disabled_and_roundtrips_when_enabled() {
+        let disabled = serde_json::to_value(SandboxResources::default()).unwrap();
+        assert!(disabled.get("nested_virt").is_none());
+        let legacy: SandboxResources = serde_json::from_value(disabled).unwrap();
+        assert!(!legacy.nested_virt);
+
+        let enabled = SandboxResources {
+            nested_virt: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(json["nested_virt"], serde_json::json!(true));
+        let decoded: SandboxResources = serde_json::from_value(json).unwrap();
+        assert!(decoded.nested_virt);
     }
 
     #[test]
