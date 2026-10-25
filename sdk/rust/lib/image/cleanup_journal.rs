@@ -1,6 +1,7 @@
 //! Recoverable image unlink intents. Hard links retain the exact admitted inode, so recovery
 //! cannot unlink a new publication at the same name after an interrupted cleanup.
 
+use std::collections::HashSet;
 use std::fs::{DirEntry, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -166,7 +167,9 @@ impl Journal {
             return Ok(false);
         };
 
-        let owned = Self::file_is_owned(db, cache, relative, &path, &pinned).await?;
+        let owned = self
+            .file_is_owned(db, cache, relative, &path, &pinned)
+            .await?;
         if !owned {
             match same_file(&path, &pinned) {
                 Ok(true) => {
@@ -185,6 +188,7 @@ impl Journal {
 
     /// Query owners only after entry admission, never from an earlier catalog snapshot.
     async fn file_is_owned(
+        &self,
         db: &DbReadConnection,
         cache: &GlobalCache,
         relative: &Path,
@@ -197,6 +201,7 @@ impl Journal {
             .and_then(|part| part.as_os_str().to_str())
         {
             Some("manifests") => Self::metadata_is_owned(db, cache, path, pinned).await?,
+            Some("flat") => self.flat_is_owned(db, cache, relative).await?,
             Some("layers") => layer::Entity::find().all(db).await?.into_iter().any(|row| {
                 row.diff_id
                     .parse()
@@ -215,6 +220,39 @@ impl Journal {
         };
 
         Ok(owned)
+    }
+
+    /// A flat ref is owned while its manifest is in the catalog. A blob is owned while a ref names
+    /// it that this journal does not delete, or that it would delete but whose manifest is back.
+    async fn flat_is_owned(
+        &self,
+        db: &DbReadConnection,
+        cache: &GlobalCache,
+        relative: &Path,
+    ) -> MicrosandboxResult<bool> {
+        let path = self.root.join(relative);
+        let live_refs = manifest::Entity::find()
+            .all(db)
+            .await?
+            .into_iter()
+            .filter_map(|row| row.digest.parse().ok())
+            .map(|digest| cache.flat_ref_path(&digest))
+            .collect::<HashSet<_>>();
+        if relative
+            .components()
+            .nth(1)
+            .and_then(|part| part.as_os_str().to_str())
+            == Some("refs")
+        {
+            return Ok(live_refs.contains(&path));
+        }
+        let deleted_refs = self
+            .files
+            .iter()
+            .map(|relative| self.root.join(relative))
+            .filter(|candidate| !live_refs.contains(candidate))
+            .collect();
+        Ok(cache.named_flat_blob_paths(&deleted_refs)?.contains(&path))
     }
 
     /// Metadata can be retained by its reference name or by the pinned generation's digest.
@@ -425,22 +463,27 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
 
 fn validate_relative(path: &Path) -> MicrosandboxResult<()> {
     let components = path.components().collect::<Vec<_>>();
-    if components.len() != 2
-        || !components
-            .iter()
-            .all(|part| matches!(part, Component::Normal(_)))
+    let names = components
+        .iter()
+        .map(|part| part.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    if !components
+        .iter()
+        .all(|part| matches!(part, Component::Normal(_)))
         || !matches!(
-            components[0].as_os_str().to_str(),
-            Some("manifests" | "layers" | "fsmeta" | "vmdk")
+            names.as_slice(),
+            [Some("manifests" | "layers" | "fsmeta" | "vmdk"), _]
+                | [Some("flat"), Some("refs" | "blobs"), _]
         )
     {
         return Err(std::io::Error::other("invalid cache deletion journal path").into());
     }
     let extension = path.extension().and_then(|part| part.to_str());
-    let expected = match components[0].as_os_str().to_str() {
-        Some("manifests") => "json",
-        Some("layers" | "fsmeta") => "erofs",
-        Some("vmdk") => "vmdk",
+    let expected = match names.as_slice() {
+        [Some("manifests"), _] | [Some("flat"), Some("refs"), _] => "json",
+        [Some("layers" | "fsmeta"), _] => "erofs",
+        [Some("vmdk"), _] => "vmdk",
+        [Some("flat"), Some("blobs"), _] => "raw",
         _ => unreachable!("validated above"),
     };
     if extension != Some(expected) {
