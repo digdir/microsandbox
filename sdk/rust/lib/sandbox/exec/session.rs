@@ -48,8 +48,33 @@ pub struct ExecOptions {
     /// Allocate a PTY (pseudo-terminal).
     pub tty: bool,
 
+    /// Initial terminal dimensions when `tty` is enabled.
+    pub terminal_size: Option<TerminalSize>,
+
     /// Resource limits applied before exec via `setrlimit()`.
     pub rlimits: Vec<Rlimit>,
+}
+
+/// Dimensions of a pseudo-terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    /// Number of terminal rows.
+    pub rows: u16,
+
+    /// Number of terminal columns.
+    pub cols: u16,
+}
+
+impl TerminalSize {
+    /// The size of a pseudo-terminal whose caller sets none.
+    pub const DEFAULT: Self = Self { rows: 24, cols: 80 };
+}
+
+impl ExecOptions {
+    /// The dimensions to allocate the pseudo-terminal with.
+    pub(crate) fn pty_size(&self) -> TerminalSize {
+        self.terminal_size.unwrap_or(TerminalSize::DEFAULT)
+    }
 }
 
 /// Builder for [`ExecOptions`].
@@ -260,6 +285,12 @@ impl ExecOptionsBuilder {
     /// editors, `top`); disable for scripts and batch jobs (default: false).
     pub fn tty(mut self, enabled: bool) -> Self {
         self.options.tty = enabled;
+        self
+    }
+
+    /// Set the initial dimensions of the allocated pseudo-terminal.
+    pub fn terminal_size(mut self, rows: u16, cols: u16) -> Self {
+        self.options.terminal_size = Some(TerminalSize { rows, cols });
         self
     }
 
@@ -636,7 +667,7 @@ pub(crate) mod agent {
 
     use super::{
         ExecEvent, ExecHandle, ExecOptions, ExecOutput, ExecSink, ExitStatus, StdinMode,
-        StreamTimeout,
+        StreamTimeout, TerminalSize,
         io::{self, EventReceiver},
     };
 
@@ -647,18 +678,7 @@ pub(crate) mod agent {
         cmd: String,
         opts: ExecOptions,
     ) -> MicrosandboxResult<ExecHandle> {
-        exec_stream_with_pty_size(backend, name, config, cmd, opts, 24, 80).await
-    }
-
-    pub(crate) async fn exec_stream_with_pty_size(
-        backend: &dyn crate::backend::Backend,
-        name: &str,
-        config: &SandboxConfig,
-        cmd: String,
-        opts: ExecOptions,
-        rows: u16,
-        cols: u16,
-    ) -> MicrosandboxResult<ExecHandle> {
+        let TerminalSize { rows, cols } = opts.pty_size();
         let client = Arc::new(connect_agent(backend, name).await?);
         let policy = client.ready()?.exec_limits;
 
@@ -684,6 +704,7 @@ pub(crate) mod agent {
             env,
             rlimits,
             tty,
+            terminal_size: _,
             stdin: stdin_mode,
             timeout,
         } = opts;
@@ -1121,6 +1142,30 @@ pub(crate) mod agent {
                 .await
                 .unwrap();
             }
+        }
+
+        #[test]
+        fn pty_size_follows_terminal_size_and_defaults_to_24_by_80() {
+            use super::super::ExecOptionsBuilder;
+
+            let unsized_options = ExecOptionsBuilder::default().tty(true).build().unwrap();
+            assert_eq!(
+                unsized_options.pty_size(),
+                TerminalSize { rows: 24, cols: 80 }
+            );
+
+            let sized = ExecOptionsBuilder::default()
+                .tty(true)
+                .terminal_size(40, 120)
+                .build()
+                .unwrap();
+            assert_eq!(
+                sized.pty_size(),
+                TerminalSize {
+                    rows: 40,
+                    cols: 120
+                }
+            );
         }
 
         #[tokio::test]
