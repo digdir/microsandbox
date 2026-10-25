@@ -570,6 +570,9 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     {
         return Err(unsupported("guest_clock"));
     }
+    if config.spec.resources.nested_virt {
+        return Err(unsupported("nested_virt"));
+    }
 
     // The shared default is harmless because Cloud owns metrics collection.
     // Any caller override would otherwise be mistaken for an honored guest

@@ -297,6 +297,9 @@ pub struct VmConfig {
     /// Host control over the guest wall clock during boot, restore, and resume.
     pub guest_clock: microsandbox_types::GuestClockPolicy,
 
+    /// Expose hardware virtualization to the guest.
+    pub nested_virt: bool,
+
     /// Protected memory cache resolved by the sandbox's owning local backend.
     pub memory_cache_dir: Option<PathBuf>,
 
@@ -618,6 +621,7 @@ impl std::fmt::Debug for VmConfig {
             .field("libkrunfw_path", &self.libkrunfw_path)
             .field("thp", &self.thp)
             .field("guest_clock", &self.guest_clock)
+            .field("nested_virt", &self.nested_virt)
             .field("vcpus", &self.vcpus)
             .field("memory_mib", &self.memory_mib)
             .field("max_cpus", &self.max_cpus)
@@ -1951,6 +1955,9 @@ fn build_vm(
     let agent_queue_size = agent_primary_queue_size(bulk_console_backend.is_some());
     let vm = &config.vm;
     vm.validate_custom_backends()?;
+    if vm.nested_virt {
+        validate_nested_virt(vm.checkpoint_restore.is_some()).map_err(RuntimeError::Custom)?;
+    }
     let mut owned_directory_checkpoints = std::collections::BTreeMap::new();
     // Collects the runtime-owned bootstrap rootfs directories created for
     // unix block-root sandboxes; the caller reclaims them if this VM is
@@ -2007,7 +2014,8 @@ fn build_vm(
                 .memory_mib(vm.memory_mib as usize)
                 .max_vcpus(vm.max_cpus.max(vm.vcpus))
                 .max_memory_mib((vm.max_memory_mib.max(vm.memory_mib)) as usize)
-                .balloon_stats_interval(balloon_stats_interval);
+                .balloon_stats_interval(balloon_stats_interval)
+                .nested_virt(vm.nested_virt);
             if let Some(targets) = host_placement.vcpu_targets {
                 let affinity = targets
                     .iter()
@@ -3895,6 +3903,15 @@ fn thp_kernel_cmdline(policy: microsandbox_types::TransparentHugePagePolicy) -> 
     format!("transparent_hugepage={}", policy.as_str())
 }
 
+/// Refuses nested virtualization where it cannot be honored before any device is constructed.
+fn validate_nested_virt(restoring: bool) -> Result<(), String> {
+    if restoring {
+        // Captures of nested guests are refused, so a restore source cannot carry one.
+        return Err("checkpoint restore is not supported with nested virtualization".into());
+    }
+    crate::nested_virt::host_support()
+}
+
 fn agent_kernel_cmdline(
     thp: microsandbox_types::TransparentHugePagePolicy,
     transport: AgentTransportProfile,
@@ -3926,7 +3943,7 @@ mod tests {
         append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame,
         guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override, parse_mount_spec,
         prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline, validate_disk_format,
+        thp_kernel_cmdline, validate_disk_format, validate_nested_virt,
     };
     #[cfg(unix)]
     use super::{
@@ -3947,6 +3964,12 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn nested_virt_refuses_checkpoint_restore_before_probing_the_host() {
+        let error = validate_nested_virt(true).unwrap_err();
+        assert!(error.contains("checkpoint restore"), "{error}");
+    }
 
     fn fs_context() -> Context {
         Context {
@@ -4353,6 +4376,7 @@ mod tests {
             libkrunfw_path: std::path::PathBuf::from("/nonexistent/libkrunfw.so"),
             thp: Default::default(),
             guest_clock: Default::default(),
+            nested_virt: false,
             memory_cache_dir: None,
             vcpus: 1,
             memory_mib: 256,

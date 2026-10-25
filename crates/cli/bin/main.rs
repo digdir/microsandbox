@@ -309,6 +309,7 @@ fn main() {
                     guest_clock: true,
                     fs_state_limit: true,
                     exec_limits: true,
+                    nested_virt: true,
                 })
                 .expect("serialize capabilities")
             );

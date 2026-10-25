@@ -104,6 +104,11 @@ pub struct LaunchCapabilities {
     /// Sandbox-owned execution policy is installed and enforced by the runtime.
     #[serde(default)]
     pub exec_limits: bool,
+
+    /// The launch field `nested_virt` is honored by the runtime.
+    /// Older runtimes omit this capability.
+    #[serde(default)]
+    pub nested_virt: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.
@@ -193,6 +198,11 @@ pub struct LaunchConfig {
     /// runtimes that predate the field keep accepting ordinary launches.
     #[serde(default, skip_serializing_if = "GuestClockPolicy::is_sync")]
     pub guest_clock: GuestClockPolicy,
+
+    /// Expose hardware virtualization to the guest. Omitted when disabled, so a runtime that
+    /// predates the field rejects an enabled launch instead of silently booting without it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested_virt: bool,
 
     /// Backend-resolved protected cache for explicit memory captures and restores.
     #[serde(default, skip_serializing_if = "Option::is_none")]

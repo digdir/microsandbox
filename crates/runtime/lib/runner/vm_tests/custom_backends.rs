@@ -212,6 +212,7 @@ fn config(directory: &Path) -> Config {
             libkrunfw_path: Default::default(),
             thp: Default::default(),
             guest_clock: Default::default(),
+            nested_virt: false,
             memory_cache_dir: None,
             vcpus: 1,
             memory_mib: 256,
