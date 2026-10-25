@@ -11,7 +11,7 @@ use microsandbox_protocol::jobs::{JobOperation, JobResponse};
 
 #[cfg(feature = "local")]
 use crate::sandbox::SandboxStatus;
-use crate::sandbox::exec::{ExecOptionsBuilder, StdinMode};
+use crate::sandbox::exec::{ExecOptionsBuilder, StdinMode, TerminalSize};
 use crate::sandbox::{Sandbox, SandboxHandle, build_exec_request};
 
 #[cfg(feature = "local")]
@@ -64,6 +64,7 @@ impl Sandbox {
             }
             _ => None,
         };
+        let TerminalSize { rows, cols } = options.pty_size();
         let request = build_exec_request(
             self.config(),
             cmd.into(),
@@ -73,8 +74,8 @@ impl Sandbox {
             &options.env,
             &options.rlimits,
             options.tty,
-            24,
-            80,
+            rows,
+            cols,
         );
         let target = Target {
             backend: self.backend().clone(),
