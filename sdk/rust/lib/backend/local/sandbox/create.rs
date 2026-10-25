@@ -41,8 +41,8 @@ use microsandbox_db::DbWriteConnection;
 use microsandbox_db::pool::DbPools;
 use microsandbox_image::snapshot::SnapshotRootDisk;
 use microsandbox_image::{
-    CachedImageMetadata, Digest, GlobalCache, PullOptions, PullProgress, PullProgressSender,
-    PullResult, Reference, Registry, RootfsMaterialization, ext4, tree,
+    CachedImageMetadata, Digest, FlatRootfsRef, GlobalCache, PullOptions, PullProgress,
+    PullProgressSender, PullResult, Reference, Registry, RootfsMaterialization, ext4, tree,
 };
 use microsandbox_runtime::ipc::SandboxSocketPaths;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, sea_query::Expr};
@@ -513,6 +513,7 @@ impl LocalBackend {
             };
 
             // Retain file ownership through insertion of the sandbox/rootfs catalog rows.
+            let image_cache = cache_operation.clone();
             image_operations.push(cache_operation);
 
             // A flat root with patches rebuilds its tree from the per-layer EROFS images instead
@@ -618,15 +619,18 @@ impl LocalBackend {
                     {
                         None
                     } else {
-                        let flat_ref = cache
-                            .read_flat_ref(&pull_result.manifest_digest)?
-                            .ok_or_else(|| {
-                                MicrosandboxError::Custom(format!(
-                                    "flat rootfs for {} is missing from the image cache; a \
+                        // Clone a generation this create's operation leases. A publisher may
+                        // have replaced the ref since resolution leased an earlier one.
+                        let flat_ref =
+                            read_flat_ref_leased(&image_cache, &pull_result.manifest_digest)
+                                .await?
+                                .ok_or_else(|| {
+                                    MicrosandboxError::Custom(format!(
+                                        "flat rootfs for {} is missing from the image cache; a \
                                      concurrent image removal or prune may have removed it",
-                                    pull_result.manifest_digest
-                                ))
-                            })?;
+                                        pull_result.manifest_digest
+                                    ))
+                                })?;
                         let artifact_digest: Digest =
                             flat_ref.artifact_digest.parse().map_err(|e| {
                                 MicrosandboxError::Custom(format!(
@@ -2201,6 +2205,32 @@ impl LocalBackend {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Read a flat ref, leasing it and the blob it names under `cache`'s operation scope. A ref
+/// replaced before its blob's lease is read again, as the image crate's leased readers do.
+async fn read_flat_ref_leased(
+    cache: &GlobalCache,
+    manifest_digest: &Digest,
+) -> MicrosandboxResult<Option<FlatRootfsRef>> {
+    cache
+        .lease_paths_async(vec![cache.flat_ref_path(manifest_digest)])
+        .await?;
+    loop {
+        let Some(reference) = cache.read_flat_ref(manifest_digest)? else {
+            return Ok(None);
+        };
+        let artifact_digest: Digest = reference.artifact_digest.parse().map_err(|e| {
+            MicrosandboxError::Custom(format!("invalid flat rootfs artifact digest in cache: {e}"))
+        })?;
+        cache
+            .lease_paths_async(vec![cache.flat_blob_path(&artifact_digest)])
+            .await?;
+
+        if cache.read_flat_ref(manifest_digest)?.as_ref() == Some(&reference) {
+            return Ok(Some(reference));
+        }
+    }
+}
 
 /// Whether a flat root with patches is missing per-layer EROFS images it rebuilds its tree from.
 fn patched_flat_root_lacks_layers(
@@ -3884,5 +3914,50 @@ mod tests {
             &[missing]
         ));
         assert!(!patched_flat_root_lacks_layers(&flat, true, &cache, &[]));
+    }
+
+    #[tokio::test]
+    async fn flat_ref_reread_leases_a_generation_published_since_resolution() {
+        use microsandbox_image::storage_lease::StorageLease;
+        use microsandbox_image::{Digest, FlatRootfsRef, GlobalCache};
+
+        let home = tempdir().unwrap();
+        let cache = GlobalCache::new(home.path()).unwrap();
+        let manifest: Digest = format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+        let publish = |seed: &str| {
+            let artifact: Digest = format!("sha256:{}", seed.repeat(64)).parse().unwrap();
+            fs::write(cache.flat_blob_path(&artifact), vec![1u8; 8192]).unwrap();
+            let reference = FlatRootfsRef {
+                schema: 1,
+                manifest_digest: manifest.to_string(),
+                derivation_digest: format!("sha256:{}", "d".repeat(64)),
+                artifact_digest: artifact.to_string(),
+                materializer_abi: 1,
+                uuid: "00".repeat(16),
+                virtual_size_bytes: 8192,
+                inode_count: 2,
+                content_bytes: 0,
+            };
+            cache.write_flat_ref(&manifest, &reference).unwrap();
+            (reference, cache.flat_blob_path(&artifact))
+        };
+        let (_, resolved_blob) = publish("b");
+        let operation = cache.operation();
+        operation
+            .lease_paths(vec![cache.flat_ref_path(&manifest), resolved_blob.clone()])
+            .unwrap();
+
+        // A publisher replaces the ref after resolution leased the earlier generation.
+        let (replacement, replacement_blob) = publish("c");
+        let reread = super::read_flat_ref_leased(&operation, &manifest)
+            .await
+            .unwrap();
+
+        assert_eq!(reread, Some(replacement));
+        assert!(
+            StorageLease::try_exclusive(&replacement_blob)
+                .unwrap()
+                .is_none()
+        );
     }
 }
