@@ -23,6 +23,7 @@ use smoltcp::wire::{
 };
 
 use crate::config::{ConnectionLimit, DnsConfig, PublishedPort, TcpAcceptQueueSize};
+use crate::control::NetworkControlClient;
 use crate::engine::dns::common::ports::DnsPortType;
 use crate::engine::dns::{
     interceptor::DnsInterceptor,
@@ -251,6 +252,7 @@ pub fn smoltcp_poll_loop(
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    controller: Option<NetworkControlClient>,
 ) {
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
@@ -288,6 +290,7 @@ pub fn smoltcp_poll_loop(
         config.gateway,
         config.gateway_mac,
         config.guest_mac,
+        controller.clone(),
     );
     let mut port_publisher = PortPublisher::new(
         &published_ports,
@@ -310,6 +313,7 @@ pub fn smoltcp_poll_loop(
         config.mtu,
         tokio_handle.clone(),
         outbound_proxy.clone(),
+        controller.clone(),
     );
     udp_relay.set_max_sessions(max_udp_connections.and_then(ConnectionLimit::cap));
     udp_relay.attach_dns_forwarder(dns_forwarder_handle.clone());
@@ -320,6 +324,7 @@ pub fn smoltcp_poll_loop(
         config.gateway_mac,
         config.guest_mac,
         tokio_handle.clone(),
+        controller.clone(),
     );
 
     // Rate-limit cleanup operations: run at most once per second.
@@ -423,6 +428,12 @@ pub fn smoltcp_poll_loop(
 
                             match (platform_allows, evaluation) {
                                 (false, _) => TcpAcceptMode::Reject,
+                                // A host controller authorizes the flow from its first
+                                // flight before any host socket opens, so it never dials
+                                // ahead of the guest handshake.
+                                (true, EgressEvaluation::Allow) if controller.is_some() => {
+                                    TcpAcceptMode::AcceptImmediately
+                                }
                                 (true, EgressEvaluation::Allow) => TcpAcceptMode::WaitForUpstream,
                                 // Hostname rules need guest bytes before they
                                 // can authorize a host connection.
@@ -615,7 +626,8 @@ pub fn smoltcp_poll_loop(
                     strict,
                     conn.proxy_connect,
                     connection_outbound_proxy,
-                );
+                )
+                .with_controller(controller.clone());
                 tokio_handle.spawn(proxy.run());
                 continue;
             }
@@ -691,7 +703,8 @@ pub fn smoltcp_poll_loop(
                 strict,
                 conn.proxy_connect,
                 connection_outbound_proxy,
-            );
+            )
+            .with_controller(controller.clone());
             tokio_handle.spawn(proxy.run());
         }
 
@@ -950,6 +963,14 @@ pub(crate) fn resolve_host_dst(dst: SocketAddr, gateway: GatewayIps) -> SocketAd
         }
         _ => dst,
     }
+}
+
+/// Whether the gateway-to-loopback rewrite turned `dst` into `resolved`, i.e.
+/// the flow is bound for the host through the gateway. The proxy tasks pass
+/// this to the host controller so it can authorize host-destined flows
+/// precisely instead of guessing which address ranges name the gateway.
+pub(crate) fn is_host_destined(dst: SocketAddr, resolved: SocketAddr) -> bool {
+    resolved.ip() != dst.ip() && resolved.ip().is_loopback()
 }
 
 /// Get the current time as a smoltcp [`Instant`] using a monotonic clock.
@@ -2072,6 +2093,7 @@ mod tests {
                 handle,
                 SecretsHandle::new(Default::default()),
                 None,
+                None,
             );
         });
         let send = |guest_port, control, seq, ack, payload: &[u8]| {
@@ -2140,6 +2162,109 @@ mod tests {
             abandoned.read(&mut request).await.unwrap(),
             0,
             "abandoned host socket must close without receiving retry data"
+        );
+    }
+
+    /// A host controller authorizes each flow from its first flight, so not even a destination
+    /// the policy allows by IP is dialed before the guest handshake completes.
+    #[test]
+    fn controlled_syn_waits_for_authorization_before_dialing() {
+        const CHILD_ENV: &str = "MSB_TEST_CONTROLLED_SYN_DIAL";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::netstack::poll::tests::controlled_syn_waits_for_authorization_before_dialing",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                check_controlled_syn_waits_for_authorization(),
+            )
+            .await
+            .expect("controlled handshake regression timed out");
+        });
+    }
+
+    async fn check_controlled_syn_waits_for_authorization() {
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+
+        use crate::control::test_support::{TestController, TestDecision};
+
+        let controller = TestController::start(TestDecision::Deny).await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = Arc::new(SharedState::new(256));
+        let loop_shared = shared.clone();
+        let handle = tokio::runtime::Handle::current();
+        let client = controller.client();
+        std::thread::spawn(move || {
+            smoltcp_poll_loop(
+                loop_shared,
+                leak_poll_config(),
+                NetworkPolicy::allow_all(),
+                None,
+                DnsConfig::default(),
+                None,
+                vec![],
+                false,
+                None,
+                None,
+                TcpAcceptQueueSize::DEFAULT,
+                None,
+                handle,
+                SecretsHandle::new(Default::default()),
+                None,
+                Some(client),
+            );
+        });
+        let mut frame = build_tcp_frame(40000, port, TcpControl::Syn, 1000, None, &[]);
+        let guest = IpAddress::Ipv4(Ipv4Addr::from(GUEST_IP));
+        let gateway = IpAddress::Ipv4(Ipv4Addr::from(GATEWAY_IP));
+        let mut ip = Ipv4Packet::new_unchecked(&mut frame[14..34]);
+        ip.set_dst_addr(Ipv4Addr::from(GATEWAY_IP));
+        ip.fill_checksum();
+        TcpPacket::new_unchecked(&mut frame[34..]).fill_checksum(&guest, &gateway);
+        shared
+            .tx_ring
+            .push(build_arp_request_frame(GUEST_MAC, GUEST_IP, GATEWAY_IP))
+            .unwrap();
+        shared.tx_ring.push(frame).unwrap();
+        shared.tx_wake.wake();
+
+        // The guest handshake completes without waiting for a host connection.
+        loop {
+            if let Some((_, ack, syn, _, rst)) = last_tcp_reply(&shared) {
+                assert!(!rst);
+                if syn {
+                    assert_eq!(ack, 1001);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "a controlled flow must not dial before its authorization"
         );
     }
 
@@ -2220,6 +2345,7 @@ mod tests {
                 None,
                 handle,
                 SecretsHandle::new(Default::default()),
+                None,
                 None,
             );
         });

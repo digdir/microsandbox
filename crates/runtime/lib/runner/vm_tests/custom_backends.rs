@@ -194,6 +194,8 @@ fn config(directory: &Path) -> Config {
         writeback_lease_dir: directory.into(),
         block_writeback_pool_bytes: None,
         agent_sock_path: directory.join("agent.sock"),
+        #[cfg(feature = "net")]
+        network_controlled: false,
         startup_command: None,
         #[cfg(unix)]
         startup_fd: None,
