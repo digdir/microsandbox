@@ -1,13 +1,14 @@
 //! Integration tests for opt-in nested virtualization.
 //!
-//! These tests require KVM (or libkrun on macOS). The `#[msb_test]`
+//! These tests require KVM (or libkrun on macOS and Windows). The `#[msb_test]`
 //! attribute marks them `#[ignore]`, so plain `cargo test --workspace`
 //! skips them. Run them via:
 //!
 //!     cargo nextest run -p microsandbox --test nested_virt --run-ignored=only
 //!
-//! Set `MSB_TEST_EXPECT_NESTED_VIRT=1` where the host has nested KVM, as CI does, so the test
-//! fails instead of checking only the refusal if the host check wrongly refuses it.
+//! Set `MSB_TEST_EXPECT_NESTED_VIRT=1` where the host supports nesting, as CI does with nested
+//! KVM, so the test fails instead of checking only the refusal if the host check wrongly
+//! refuses it.
 
 use microsandbox::runtime::nested_virt_host_support;
 use microsandbox::{MicrosandboxError, Operation, Sandbox, Snapshot};
@@ -45,7 +46,7 @@ fn host_support() -> Result<(), String> {
     if let Err(reason) = &support
         && std::env::var_os("MSB_TEST_EXPECT_NESTED_VIRT").is_some()
     {
-        panic!("the host has nested KVM, but the host check refused it: {reason}");
+        panic!("the host is expected to support nesting, but the host check refused it: {reason}");
     }
     support
 }

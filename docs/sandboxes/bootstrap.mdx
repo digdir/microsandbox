@@ -303,10 +303,11 @@ Without the setting, guests have no `/dev/kvm`. Creating, starting, or enabling 
 
 - macOS with an Apple M3 or newer chip and macOS 15 or newer. The guest's kernel logs `Hyp nVHE mode initialized successfully`, and its own VMs cannot nest further.
 - Linux x86_64, when the `kvm_intel` or `kvm_amd` module has `nested` enabled.
+- Windows x86_64 with Windows 11 or Windows Server 2022 or newer, when the Windows Hypervisor Platform accepts a partition with nested virtualization. Intel and AMD processors both work; Windows on Arm does not.
 
 Full snapshots, forks, and full restores capture execution state, which does not cover the VMs a guest runs, so they are refused while nested virtualization is enabled. Disk-only snapshots remain available, but a sandbox restored from one starts without nested virtualization. VMs inside the guest pay extra overhead on every exit to the hypervisor, so their disk and device I/O are noticeably slower than the outer sandbox's. Only the Rust SDK exposes the setting.
 
-The guest can then reach the host hypervisor's nested virtualization support: KVM's nested VMX or SVM handling on Linux, and EL2 emulation in Hypervisor.framework on macOS. That adds to what code in the sandbox can attack on the host, so enable it only for sandboxes that need to run VMs.
+The guest can then reach the host hypervisor's nested virtualization support: KVM's nested VMX or SVM handling on Linux, Hyper-V's on Windows, and EL2 emulation in Hypervisor.framework on macOS. That adds to what code in the sandbox can attack on the host, so enable it only for sandboxes that need to run VMs.
 
 ## Custom init system
 

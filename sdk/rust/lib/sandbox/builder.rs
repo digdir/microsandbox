@@ -413,10 +413,10 @@ impl SandboxBuilder {
 
     /// Expose hardware virtualization to the guest so it can run its own VMs through `/dev/kvm`.
     ///
-    /// Supported on macOS hosts with an Apple M3 or newer chip and macOS 15 or newer, and on
-    /// Linux x86_64 hosts whose KVM module has nested virtualization enabled. Creating or
-    /// starting the sandbox fails on other hosts; `runtime::nested_virt_host_support` checks
-    /// first. `modify().nested_virt(..)` changes it for an existing sandbox.
+    /// Supported on macOS hosts with an Apple M3 or newer chip and macOS 15 or newer, on Linux
+    /// x86_64 hosts whose KVM module has nested virtualization enabled, and on Windows x86_64
+    /// hosts with Windows 11 or Windows Server 2022 or newer. Creating or starting the sandbox
+    /// fails on other hosts; `runtime::nested_virt_host_support` checks first. `modify().nested_virt(..)` changes it for an existing sandbox.
     ///
     /// The guest can then reach the host hypervisor's nested virtualization support, which adds
     /// to what code in the sandbox can attack on the host. Enable it only where VMs are needed.
