@@ -11,6 +11,7 @@ use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 
 use crate::cache::lock::CacheLockGuard;
 use crate::ext4::{EXT4_ROOTFS_MATERIALIZER_ABI, validate_rootfs_image};
+use crate::storage_lease::StorageLease;
 use crate::{
     CachedImageMetadata, Digest, FlatRootfsRef, GlobalCache, ImageError, ImageResult, Platform,
     Reference,
@@ -81,15 +82,21 @@ pub async fn export_prepared_root(
     let manifest_digest = parse_digest(&image.manifest_digest, "image manifest digest")?;
     validate_pinned_reference(reference, &manifest_digest)?;
     let layer_diff_ids = layer_diff_ids(&image)?;
-    let root =
-        crate::flat::read_current_flat_ref(cache, &manifest_digest, &layer_diff_ids, platform)?
-            .ok_or_else(|| {
-                ImageError::ConfigParse(format!(
-                    "flat rootfs is not materialized for {} on {}",
-                    image.manifest_digest,
-                    platform_name(platform)
-                ))
-            })?;
+    // Image cleanup may remove flat roots, so hold the ref and its blob until the copy is done.
+    let (root, _root_leases) = crate::flat::read_current_flat_ref_leased_async(
+        cache,
+        &manifest_digest,
+        &layer_diff_ids,
+        platform,
+    )
+    .await?;
+    let root = root.ok_or_else(|| {
+        ImageError::ConfigParse(format!(
+            "flat rootfs is not materialized for {} on {}",
+            image.manifest_digest,
+            platform_name(platform)
+        ))
+    })?;
     let metadata = PreparedRootMetadata {
         schema: PREPARED_ROOT_SCHEMA,
         source_reference: reference.to_string(),
@@ -129,6 +136,10 @@ pub async fn export_prepared_root(
 ///
 /// The caller must authenticate the bundle's provenance through its transport. Import validates
 /// the bundle's internal image/root bindings and bytes, but does not rematerialize the OCI layers.
+///
+/// Import leases the root's flat ref and blob. Pass an operation scope from
+/// [`GlobalCache::operation`] and keep it until the catalog records the image, so that image
+/// cleanup cannot reclaim the root first.
 pub async fn import_prepared_root(
     cache: &GlobalCache,
     reference: &Reference,
@@ -144,6 +155,11 @@ pub async fn import_prepared_root(
     })?;
     validate_metadata(&metadata, reference, platform)?;
 
+    let artifact_digest = parse_digest(&metadata.root.artifact_digest, "flat artifact digest")?;
+    // Publication may reuse an identical blob that interrupted image cleanup still journals.
+    let blob_lease = cache
+        .lease_paths_async(vec![cache.flat_blob_path(&artifact_digest)])
+        .await?;
     // Wait for the lock without occupying the blocking pool, as flat materialization does.
     let derivation_digest =
         parse_digest(&metadata.root.derivation_digest, "root derivation digest")?;
@@ -152,39 +168,49 @@ pub async fn import_prepared_root(
     let blocking_cache = cache.clone();
     let blocking_platform = platform.clone();
     let blocking_source = source.to_path_buf();
-    let metadata = tokio::task::spawn_blocking(move || {
+    // The worker owns the blob's lease, because it keeps publishing if this future is dropped.
+    let (metadata, leases) = tokio::task::spawn_blocking(move || {
         let _lock_guard = lock_guard;
-        import_prepared_root_blocking(
+        let (metadata, root_leases) = import_prepared_root_blocking(
             &blocking_cache,
             &blocking_platform,
             &blocking_source,
             metadata,
-        )
+        )?;
+        Ok::<_, ImageError>((metadata, (blob_lease, root_leases)))
     })
     .await
     .map_err(|error| ImageError::Io(std::io::Error::other(error)))??;
 
+    // Without an operation scope, these leases are the root's only protection until the
+    // metadata names it.
+    let _leases = leases;
     cache
         .write_image_metadata_async(reference, &metadata.image)
         .await?;
     Ok(metadata)
 }
 
-/// Publish the flat root unless it is already cached. The caller holds the derivation's flat lock.
+/// Publish the flat root unless it is already cached, returning the leases on an existing root.
+/// The caller holds the derivation's flat lock and a lease on the artifact blob.
 fn import_prepared_root_blocking(
     cache: &GlobalCache,
     platform: &Platform,
     source: &Path,
     metadata: PreparedRootMetadata,
-) -> ImageResult<PreparedRootMetadata> {
+) -> ImageResult<(PreparedRootMetadata, Vec<StorageLease>)> {
     let manifest_digest = parse_digest(&metadata.image.manifest_digest, "image manifest digest")?;
     let derivation_digest =
         parse_digest(&metadata.root.derivation_digest, "root derivation digest")?;
 
     let layer_diff_ids = layer_diff_ids(&metadata.image)?;
-    if crate::flat::read_current_flat_ref(cache, &manifest_digest, &layer_diff_ids, platform)?
-        .is_none()
-    {
+    let (existing, existing_leases) = crate::flat::read_current_flat_ref_leased(
+        cache,
+        &manifest_digest,
+        &layer_diff_ids,
+        platform,
+    )?;
+    if existing.is_none() {
         let work_dir = cache.flat_work_dir(&derivation_digest);
         std::fs::create_dir_all(&work_dir).map_err(|source| cache_error(&work_dir, source))?;
         let _work_guard = scopeguard::guard(work_dir.clone(), |path| {
@@ -213,10 +239,10 @@ fn import_prepared_root_blocking(
         })?;
         let artifact_digest = parse_digest(&metadata.root.artifact_digest, "flat artifact digest")?;
         cache.publish_flat_blob(&candidate, &artifact_digest, actual_size)?;
-        cache.write_flat_ref(&manifest_digest, &metadata.root)?;
+        cache.replace_flat_ref(&manifest_digest, &metadata.root)?;
     }
 
-    Ok(metadata)
+    Ok((metadata, existing_leases))
 }
 
 fn validate_metadata(
@@ -602,6 +628,63 @@ mod tests {
             .await
             .unwrap();
 
+        // Dropping an import keeps the blob's lease while its worker can still publish. A held
+        // ref lease stops the worker before it reads the ref.
+        let canceled_dir = tempdir().unwrap();
+        let canceled_cache = GlobalCache::new(canceled_dir.path()).unwrap();
+        let canceled_blob = canceled_cache.flat_blob_path(&artifact_digest);
+        let held_ref =
+            StorageLease::exclusive(&canceled_cache.flat_ref_path(&manifest_digest)).unwrap();
+        let importing = tokio::spawn({
+            let cache = canceled_cache.clone();
+            let reference = reference.clone();
+            let platform = platform.clone();
+            let bundle = bundle_dir.path().to_path_buf();
+            async move { import_prepared_root(&cache, &reference, &platform, &bundle).await }
+        });
+        // Import spawns its worker as soon as it holds the derivation's flat lock.
+        let flat_lock = microsandbox_utils::process_lock::open_lock_file(
+            &canceled_cache.flat_lock_path(&derivation_digest),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while microsandbox_utils::process_lock::try_lock_exclusive(&flat_lock).unwrap() {
+            microsandbox_utils::process_lock::unlock(&flat_lock).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the import never took its flat lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        importing.abort();
+        assert!(importing.await.unwrap_err().is_cancelled());
+        assert!(
+            StorageLease::try_exclusive(&canceled_blob)
+                .unwrap()
+                .is_none(),
+            "a dropped import released its blob's lease before its worker finished"
+        );
+
+        drop(held_ref);
+        // The worker still decompresses, validates and publishes the root, which takes several
+        // seconds on a loaded machine.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while StorageLease::try_exclusive(&canceled_blob)
+            .unwrap()
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped import's worker never released its blob lease"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            canceled_cache.read_flat_ref(&manifest_digest).unwrap(),
+            Some(root.clone())
+        );
+
         let imported_dir = tempdir().unwrap();
         let imported_cache = GlobalCache::new(imported_dir.path()).unwrap();
         let first_import =
@@ -629,6 +712,23 @@ mod tests {
             artifact.virtual_size_bytes
         );
         validate_rootfs_image(&imported_blob).unwrap();
+
+        // Journal recovery admits a flat blob on its own lease, so the caller's operation
+        // retains both until the catalog records the import.
+        let leased_dir = tempdir().unwrap();
+        let leased_cache = GlobalCache::new(leased_dir.path()).unwrap();
+        for _ in 0..2 {
+            let operation = leased_cache.operation();
+            import_prepared_root(&operation, &reference, &platform, bundle_dir.path())
+                .await
+                .unwrap();
+            for path in [
+                leased_cache.flat_ref_path(&manifest_digest),
+                leased_cache.flat_blob_path(&artifact_digest),
+            ] {
+                assert!(StorageLease::try_exclusive(&path).unwrap().is_none());
+            }
+        }
 
         std::fs::write(
             bundle_dir.path().join(PREPARED_ROOT_PAYLOAD_FILENAME),

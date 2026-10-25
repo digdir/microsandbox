@@ -121,7 +121,7 @@ msb image inspect python --format json
 
 ## msb rmi
 
-Remove one or more cached images and their layers (layers shared with other images are kept).
+Remove one or more cached images, their layers and their flat root disks (artifacts shared with other images are kept).
 
 <CodeGroup>
 ```bash Shell
@@ -151,7 +151,7 @@ msb image prune --format json
 
 Images referenced by sandboxes or indexed snapshots are kept. `msb rmi --force` can remove a specific reference, but retains backing and cached metadata needed by those dependencies and refuses to remove a reference held by an active operation. Retained metadata files may remain after the last dependency is removed; pruning does not sweep unindexed metadata files.
 
-Prune skips cache entries held by participating pulls, imports, exports, or sandbox creation and continues with unrelated entries. Cleanup commits bounded batches, so an error can leave earlier batches completed. Shared aliases are checked together before removing their metadata file. JSON reports include `skipped_in_use`, counting busy references, manifests, and layers. Stable lock files remain in the cache. Interrupted cleanup is recovered on a later image prune or removal, with the catalog and exact file identity checked again before deletion.
+Prune skips cache entries held by participating pulls, imports, exports, or sandbox creation and continues with unrelated entries. Cleanup commits bounded batches, so an error can leave earlier batches completed. Shared aliases are checked together before removing their metadata file. JSON reports include `skipped_in_use`, counting busy references, manifests, layers, and flat root disks. Stable lock files remain in the cache. Interrupted cleanup is recovered on a later image prune or removal, with the catalog and exact file identity checked again before deletion.
 
 Concurrent cleanup requires every accessing CLI and SDK to participate in the lease protocol. Older clients can ignore these locks; coordinate a maintenance window when they share the same storage. Ordinary runtime and snapshot formats are unchanged. Pull and sandbox creation report an error if image ownership cannot be persisted in the catalog.
 
