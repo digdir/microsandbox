@@ -12,7 +12,11 @@ path = "lib/lib.rs"
 
 [features]
 default = ["engine"]
+# Host network control protocol: the runtime client and the embedding host's
+# listener. Needs no packet engine, so the SDK can bind the host side alone.
+control = ["dep:serde_json", "dep:tokio"]
 engine = [
+    "control",
     "dep:base64",
     "dep:bytes",
     "dep:core-foundation",
