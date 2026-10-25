@@ -4,9 +4,11 @@ name: Check Digdir
 # matrices remain outside downstream CI. The hardware-virtualization lanes are
 # upstream's, run on GitHub-hosted runners, which expose KVM.
 #
-# Runs on pull requests and on demand. Caches are saved only in runs on
-# main-digdir, which the release runbook in MAINTAINING-digdir.md makes part
-# of every release.
+# Runs on pull requests and on demand. It builds the runtime once, with the
+# release profile, runs the integration and smoke tests against those
+# binaries, and assembles them into the release assets, so that
+# release-digdir.yml publishes exactly what this run tested without building
+# anything. Caches are saved only in runs on main-digdir.
 
 on:
   pull_request:
@@ -28,6 +30,10 @@ env:
   CARGO_INCREMENTAL: "0"
   LIBKRUNFW_VERSION: "5.6.1"
   LIBKRUNFW_ABI: "5"
+  # Every shipped Linux ELF is compiled or linked inside the architecture-native
+  # manylinux 2.28 container, so the published runtime does not import glibc
+  # symbols newer than the hosts it is installed on.
+  LINUX_GLIBC_BASELINE: "2.28"
 
 jobs:
   select-run:
@@ -109,6 +115,26 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Check the upstream base
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          upstream_tag="v${version%-digdir.*}"
+          upstream_commit=$(git ls-remote https://github.com/superradcompany/microsandbox.git \
+            "refs/tags/${upstream_tag}" "refs/tags/${upstream_tag}^{}" | awk 'END { print $1 }')
+          if [ -z "${upstream_commit}" ]; then
+            echo "::error::upstream release tag ${upstream_tag} not found"
+            exit 1
+          fi
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${upstream_commit}...${GITHUB_SHA}" --jq .status)
+          if [ "${status}" != ahead ]; then
+            echo "::error::${GITHUB_SHA} is not based on upstream ${upstream_tag} (${upstream_commit}): ${status}"
+            exit 1
+          fi
 
       - uses: ./.github/actions/pinned-rust-toolchain-digdir
 
@@ -219,16 +245,16 @@ jobs:
           cache-bin: false
           cache-targets: true
           save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
-          shared-key: digdir-agentd-${{ matrix.arch }}
+          shared-key: digdir-release-agentd-${{ matrix.arch }}
 
       - name: Install musl build dependencies
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build agentd
         run: |
-          cargo build --locked --profile ci --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.target }}
+          cargo build --locked --release --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.target }}
           mkdir -p build
-          cp target/${{ matrix.target }}/ci/agentd build/agentd
+          cp target/${{ matrix.target }}/release/agentd build/agentd
 
       - name: Upload guest agent
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -253,11 +279,13 @@ jobs:
             arch: x86_64
             manylinux_image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0c87ccb5996dab6c3b7612ee4fda7b80c4ab3c44a86c2541e4a872afdf4f131b
             libkrunfw_file: libkrunfw.so.5.6.1
+            libkrunfw_asset: libkrunfw-linux-x86_64.so
           - target: linux-aarch64
             runner: ubuntu-24.04-arm
             arch: aarch64
             manylinux_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:561427136aabf3787bffb294b3515748241e0962d1527ae28bea1e076bfb9d99
             libkrunfw_file: libkrunfw.so.5.6.1
+            libkrunfw_asset: libkrunfw-linux-aarch64.so
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -268,7 +296,7 @@ jobs:
           cache-bin: false
           cache-targets: true
           save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
-          shared-key: digdir-runtime-${{ matrix.target }}
+          shared-key: digdir-release-${{ matrix.target }}
 
       - name: Install build dependencies
         run: dnf install -y libcap-ng-devel
@@ -291,15 +319,22 @@ jobs:
           cc -fPIC -DABI_VERSION=${{ env.LIBKRUNFW_ABI }} -shared \
             -Wl,-soname,libkrunfw.so.${{ env.LIBKRUNFW_ABI }} \
             -o build/${{ matrix.libkrunfw_file }} firmware/kernel.c
+          strip build/${{ matrix.libkrunfw_file }}
           cd build
           ln -sf ${{ matrix.libkrunfw_file }} libkrunfw.so.${{ env.LIBKRUNFW_ABI }}
           ln -sf libkrunfw.so.${{ env.LIBKRUNFW_ABI }} libkrunfw.so
 
       - name: Build msb
         run: |
-          cargo build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
-          cp target/ci/msb build/msb
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
+          cp target/release/msb build/msb
+
+      - name: Verify runtime and glibc baseline
+        run: |
           build/msb --version
+          python3 scripts/ci/validate_linux_glibc.py \
+            --max-version ${{ env.LINUX_GLIBC_BASELINE }} \
+            build/agentd build/msb build/${{ matrix.libkrunfw_file }}
 
       - name: Smoke test installed runtime discovery
         run: |
@@ -312,6 +347,24 @@ jobs:
         with:
           name: msb-${{ matrix.target }}
           path: build/
+          compression-level: 0
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # The bundle is created here, before any artifact round trip can
+          # normalize modes; assert the executable bit anyway.
+          chmod 755 build/msb
+          cp build/${{ matrix.libkrunfw_file }} artifacts/${{ matrix.libkrunfw_asset }}
+          tar -czf artifacts/microsandbox-${{ matrix.target }}.tar.gz \
+            -C build msb ${{ matrix.libkrunfw_file }}
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-runtime-${{ matrix.target }}
+          path: artifacts/
           compression-level: 0
 
   build-macos:
@@ -329,7 +382,7 @@ jobs:
           cache-bin: false
           cache-targets: true
           save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
-          shared-key: digdir-runtime-darwin-aarch64
+          shared-key: digdir-release-darwin-aarch64
 
       - name: Download guest agent
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -353,8 +406,8 @@ jobs:
 
       - name: Build and codesign msb
         run: |
-          cargo build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
-          cp target/ci/msb build/msb
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli
+          cp target/release/msb build/msb
           codesign --entitlements msb-entitlements.plist --force -s - build/msb
           build/msb --version
 
@@ -368,6 +421,26 @@ jobs:
         with:
           name: msb-darwin-aarch64
           path: build/
+          compression-level: 0
+
+      - name: Stage release assets
+        # bsdtar would otherwise add AppleDouble entries for extended attributes,
+        # which the runtime installer rejects.
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          chmod 755 build/msb
+          cp build/libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib artifacts/libkrunfw-darwin-aarch64.dylib
+          tar -czf artifacts/microsandbox-darwin-aarch64.tar.gz \
+            -C build msb libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-runtime-darwin-aarch64
+          path: artifacts/
           compression-level: 0
 
   rust-quality:
@@ -754,6 +827,108 @@ jobs:
           path: ${{ runner.temp }}/snapshot-branch-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
 
+  build-windows:
+    name: Build runtime (${{ matrix.target }})
+    needs: [validate, build-kernel, build-agentd]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x86_64
+            runner: windows-latest
+            arch: x86_64
+            rust_target: x86_64-pc-windows-msvc
+            vs_arch: amd64
+            vs_host_arch: amd64
+            libkrunfw_asset: libkrunfw-windows-x86_64.dll
+          - target: windows-aarch64
+            runner: windows-11-arm
+            arch: aarch64
+            rust_target: aarch64-pc-windows-msvc
+            vs_arch: arm64
+            vs_host_arch: arm64
+            libkrunfw_asset: libkrunfw-windows-aarch64.dll
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Only Windows needs libkrunfw's MSVC helper scripts.
+      - name: Checkout libkrunfw sources
+        shell: pwsh
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - uses: ./.github/actions/pinned-rust-toolchain-digdir
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          save-if: ${{ github.ref == 'refs/heads/main-digdir' }}
+          shared-key: digdir-release-${{ matrix.target }}
+
+      - name: Download kernel firmware bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-kernel-${{ matrix.arch }}
+          path: vendor/libkrunfw/
+
+      - name: Download guest agent
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-agentd-${{ matrix.arch }}
+          path: build/
+
+      - name: Build libkrunfw
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\vendor\libkrunfw\scripts\build-windows.ps1 `
+            -SkipKernelBundle `
+            -AbiVersion ${{ env.LIBKRUNFW_ABI }} `
+            -Architecture ${{ matrix.vs_arch }} `
+            -HostArchitecture ${{ matrix.vs_host_arch }} `
+            -Output libkrunfw.dll `
+            -ImportLibrary libkrunfw.lib
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Copy-Item vendor\libkrunfw\libkrunfw.dll build\libkrunfw.dll -Force
+
+      - name: Build msb
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
+          Copy-Item target\${{ matrix.rust_target }}\release\msb.exe build\msb.exe -Force
+          & build\msb.exe --version
+
+      - name: Smoke test installed runtime discovery
+        shell: pwsh
+        run: |
+          python scripts/smoke/cli/test_runtime_discovery.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/smoke/cli/runtime-discovery.py --msb build/msb.exe --libkrunfw build/libkrunfw.dll
+
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item build\libkrunfw.dll artifacts\${{ matrix.libkrunfw_asset }} -Force
+          tar.exe -czf artifacts\microsandbox-${{ matrix.target }}.tar.gz -C build msb.exe libkrunfw.dll
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-runtime-${{ matrix.target }}
+          path: artifacts/
+          compression-level: 0
+
   windows:
     name: Rust runtime and tests (${{ matrix.target }})
     needs: [validate, build-kernel, build-agentd]
@@ -819,25 +994,6 @@ jobs:
             -ImportLibrary libkrunfw.lib
           New-Item -ItemType Directory -Force -Path build | Out-Null
           Copy-Item vendor\libkrunfw\libkrunfw.dll build\libkrunfw.dll -Force
-
-      - name: Build msb
-        shell: pwsh
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-        run: |
-          $ErrorActionPreference = "Stop"
-          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
-          Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
-          cargo build --locked --profile ci --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target ${{ matrix.rust_target }}
-          Copy-Item target\${{ matrix.rust_target }}\ci\msb.exe build\msb.exe -Force
-          & build\msb.exe --version
-
-      - name: Smoke test installed runtime discovery
-        shell: pwsh
-        run: |
-          python scripts/smoke/cli/test_runtime_discovery.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/smoke/cli/runtime-discovery.py --msb build/msb.exe --libkrunfw build/libkrunfw.dll
 
       - name: Check msb
         shell: pwsh
@@ -950,3 +1106,219 @@ jobs:
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture ${{ matrix.vs_arch }} -HostArchitecture ${{ matrix.vs_host_arch }}
           cargo test --locked -p microsandbox-network --lib --target ${{ matrix.rust_target }} dns::upstream::system::windows::
+
+  # Only the source decides the notices, so they are generated while the runtime builds.
+  notices:
+    name: Third-party notices
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - uses: ./.github/actions/pinned-rust-toolchain-digdir
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.2
+
+      - name: Generate third-party notices
+        run: |
+          mkdir -p notices
+          scripts/digdir/third-party-notices.sh notices/THIRD_PARTY_NOTICES.md
+
+      - name: Upload third-party notices
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digdir-third-party-notices
+          path: notices/THIRD_PARTY_NOTICES.md
+
+  # The release assets that release-digdir.yml publishes once this tree lands on main-digdir.
+  assemble:
+    name: Assemble downstream runtime release
+    needs: [validate, notices, build-agentd, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-artifacts
+          pattern: release-runtime-*
+          merge-multiple: true
+
+      - name: Download guest agents
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: guest-agents
+          pattern: digdir-agentd-*
+
+      - name: Validate artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp guest-agents/digdir-agentd-x86_64/agentd release-artifacts/agentd-x86_64
+          cp guest-agents/digdir-agentd-aarch64/agentd release-artifacts/agentd-aarch64
+          expected=(
+            agentd-aarch64
+            agentd-x86_64
+            libkrunfw-darwin-aarch64.dylib
+            libkrunfw-linux-aarch64.so
+            libkrunfw-linux-x86_64.so
+            libkrunfw-windows-aarch64.dll
+            libkrunfw-windows-x86_64.dll
+            microsandbox-darwin-aarch64.tar.gz
+            microsandbox-linux-aarch64.tar.gz
+            microsandbox-linux-x86_64.tar.gz
+            microsandbox-windows-aarch64.tar.gz
+            microsandbox-windows-x86_64.tar.gz
+          )
+          for artifact in "${expected[@]}"; do
+            if [ ! -s "release-artifacts/${artifact}" ]; then
+              echo "::error::missing or empty release artifact: ${artifact}"
+              exit 1
+            fi
+          done
+          actual_count=$(find release-artifacts -maxdepth 1 -type f | wc -l)
+          if [ "${actual_count}" -ne "${#expected[@]}" ]; then
+            echo "::error::expected ${#expected[@]} artifacts, found ${actual_count}"
+            find release-artifacts -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+
+      # The runtime installer accepts exactly the two regular files of a bundle.
+      - name: Validate bundle entries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          import tarfile
+          from pathlib import Path
+
+          expected = {
+              "microsandbox-linux-x86_64.tar.gz": {"msb", "libkrunfw.so.5.6.1"},
+              "microsandbox-linux-aarch64.tar.gz": {"msb", "libkrunfw.so.5.6.1"},
+              "microsandbox-darwin-aarch64.tar.gz": {"msb", "libkrunfw.5.dylib"},
+              "microsandbox-windows-x86_64.tar.gz": {"msb.exe", "libkrunfw.dll"},
+              "microsandbox-windows-aarch64.tar.gz": {"msb.exe", "libkrunfw.dll"},
+          }
+          failed = False
+          for bundle, names in expected.items():
+              with tarfile.open(Path("release-artifacts") / bundle) as archive:
+                  members = archive.getmembers()
+              actual = {member.name for member in members}
+              irregular = [member.name for member in members if not member.isreg()]
+              if actual != names or len(members) != len(names) or irregular:
+                  print(f"::error::{bundle} has entries {sorted(actual)}; expected {sorted(names)}")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+      # Unix bundles must extract an executable msb; artifact round trips normalize modes.
+      - name: Validate bundled msb executable mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts/ci")
+          import importlib.util
+          spec = importlib.util.spec_from_file_location(
+              "validate_release_artifacts", "scripts/ci/validate-release-artifacts.py"
+          )
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          errors: list[str] = []
+          for bundle in (
+              "microsandbox-linux-x86_64.tar.gz",
+              "microsandbox-linux-aarch64.tar.gz",
+              "microsandbox-darwin-aarch64.tar.gz",
+          ):
+              module.validate_bundle_executable(Path("release-artifacts") / bundle, errors)
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              sys.exit(1)
+          print("bundled msb is executable in every Unix bundle")
+          PY
+
+      # Gate over the published files, not only the build-job outputs: the
+      # earlier check protects the build, this one protects the release.
+      - name: Validate Linux glibc baseline
+        run: |
+          python3 -m unittest scripts.ci.test_validate_linux_glibc
+          python3 scripts/ci/validate_linux_glibc.py \
+            --max-version ${{ env.LINUX_GLIBC_BASELINE }} \
+            release-artifacts
+
+      - name: Resolve firmware source
+        id: firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel_version=$(awk '$1 == "KERNEL_VERSION" { print $3; exit }' vendor/libkrunfw/Makefile)
+          if [ -z "${kernel_version}" ]; then
+            echo "::error::vendor/libkrunfw/Makefile must define KERNEL_VERSION"
+            exit 1
+          fi
+          echo "kernel-version=${kernel_version}" >> "${GITHUB_OUTPUT}"
+
+      # Downloads the kernel tarball and verifies it against upstream's pinned
+      # checksum, as the kernel build jobs do.
+      - name: Fetch kernel source
+        uses: ./.github/actions/cache-libkrunfw-kernel
+
+      # Named by commit rather than tag, so that the assets are final before libkrunfw is tagged.
+      - name: Add firmware source
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ steps.firmware.outputs.kernel-version }}
+        run: |
+          set -euo pipefail
+          commit=$(git -C vendor/libkrunfw rev-parse HEAD)
+          git -C vendor/libkrunfw archive --format=tar.gz --prefix="libkrunfw-${commit:0:12}/" \
+            -o "${GITHUB_WORKSPACE}/release-artifacts/libkrunfw-source.tar.gz" HEAD
+          cp "vendor/libkrunfw/tarballs/${KERNEL_VERSION}.tar.gz" "release-artifacts/${KERNEL_VERSION}.tar.gz"
+
+      - name: Download third-party notices
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: digdir-third-party-notices
+          path: release-artifacts
+
+      - name: Add licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp LICENSE release-artifacts/LICENSE
+          cp vendor/libkrunfw/LICENSE-GPL-2.0-only release-artifacts/LICENSE-libkrunfw-GPL-2.0-only
+          cp vendor/libkrunfw/LICENSE-LGPL-2.1-only release-artifacts/LICENSE-libkrunfw-LGPL-2.1-only
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd release-artifacts && sha256sum -- * > checksums.sha256)
+          (cd release-artifacts && sha256sum --check --strict checksums.sha256)
+
+      # A pull request run builds its merge with main-digdir. Named by that tree, the assets are
+      # found by the tree that lands, whatever the pull request's own head.
+      - name: Resolve the source tree
+        id: tree
+        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "${GITHUB_OUTPUT}"
+
+      # Kept as long as the repository keeps artifacts: a release can land well after its review.
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ steps.tree.outputs.tree }}
+          path: release-artifacts/
+          compression-level: 0

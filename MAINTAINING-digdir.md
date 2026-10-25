@@ -45,12 +45,14 @@ upstream surfaces the fork does not ship to the script.
 
 Upstream's workflow files stay unchanged and are disabled with `gh workflow disable <file>`. The Digdir workflows are:
 
-- `check-digdir.yml`: the checks, on pull requests and on demand. Caches are saved only in runs on `main-digdir`. It
+- `check-digdir.yml`: the checks, on pull requests and on demand. It builds the runtime once, with the release
+  profile, runs the integration and smoke tests against those binaries, and assembles them into the release assets,
+  which the run keeps as an artifact. Caches are saved only in runs on `main-digdir`. It
   includes upstream's KVM lanes from `check.yml`: the integration tests with their fixtures, and the CLI smoke tests.
   Upstream runs them on a self-hosted runner; here they run on GitHub-hosted Linux runners, which expose KVM.
 - `test-platform-digdir.yml`: a copy of upstream's `test-platform.yml`, called by `check-digdir.yml`.
-- `release-digdir.yml`: a copy of upstream's release lanes. It publishes the runtime for a `v<version>` tag; a manual
-  run builds and validates everything without publishing.
+- `release-digdir.yml`: runs when `main-digdir` moves to a version that has no release yet, and publishes the release
+  assets of the `check-digdir.yml` run that built exactly that tree. It builds nothing (see [Release](#6-release)).
 
 When synchronizing, compare upstream's release workflows, `test-platform.yml` and the KVM lanes in `check.yml` with the
 Digdir copies and adopt build and test changes. Disable new upstream workflows unless they are useful for our CI; remove
@@ -72,8 +74,8 @@ lives in upstream's `cache-libkrunfw-kernel` action.
 ## Review gates
 
 1. **After triage:** review the triage record before rebasing.
-2. **Before the tag:** review the `sync/digdir-X.Y.Z` pull request: the `range-diff` against the triage record, the
-   tree diff from the upstream tag, and the test results.
+2. **Before landing, which releases the runtime:** review the `sync/digdir-X.Y.Z` pull request: the `range-diff`
+   against the triage record, the tree diff from the upstream tag, and the test results.
 
 A rewritten sync branch never gets `pull_request` checks, so run them with `workflow_dispatch` after every push. Land
 the approved queue by moving the branch; GitHub then marks the pull request as merged:
@@ -155,19 +157,38 @@ git range-diff "$old_msb_base"..origin/main-digdir "$target_msb_tag"..sync/digdi
 
 ### 6. Release
 
-`check-digdir.yml` runs the workspace checks and the hardware-backed integration tests. Then:
+Landing a commit with a new version on `main-digdir` releases it. `release-digdir.yml` runs on the push, finds the
+oldest successful `check-digdir.yml` run in this repository that built the same tree, and publishes that run's release
+assets. It creates the `v<version>` tag on the landed commit as it publishes the release. Nothing is built twice, and
+the published runtime is the one the checks tested. A push whose version already has a release publishes nothing.
 
-1. Run `gh workflow run check-digdir.yml --ref main-digdir` and wait for it to pass.
-2. Run `gh workflow run release-digdir.yml --ref main-digdir`, a dry run that builds and validates every artifact
-   without publishing.
-3. Tag the libkrunfw commit, as libkrunfw's MAINTAINING-digdir.md describes.
-4. Tag `v<version>`. The release workflow builds and publishes the runtime for Linux, macOS and Windows.
+1. Before landing, `check-digdir.yml` must pass on exactly the tree that lands. A sync branch's run counts, since
+   moving `main-digdir` to it keeps the commit; a rewritten branch gets no `pull_request` checks, so start it with
+   `gh workflow run check-digdir.yml --ref sync/digdir-X.Y.Z`. A pull request's run builds it merged into
+   `main-digdir` as it was when the run started, which is the tree that lands unless `main-digdir` moves before the
+   merge. If it moves, rebase the pull request onto `main-digdir` and force-push it, and let its checks run again
+   before merging it.
+2. Tag the libkrunfw commit, as libkrunfw's MAINTAINING-digdir.md describes.
+3. Land it. A synchronization lands by moving `main-digdir` to the approved sync branch, as
+   [Review gates](#review-gates) shows. Never use its pull request's merge button, which would replay the rebuilt
+   queue onto the old `main-digdir`. Once `main-digdir` points at the sync branch's head, GitHub marks the pull request
+   as merged by itself. Don't close or merge it. Any other change lands through its pull request's merge button, which
+   rebase-merges it. Either way, the push releases the runtime if its `Cargo.toml` version has no release yet. Only a
+   version bump does: the last commit of a synchronization, or a pull request that bumps `-digdir.<n>` between
+   synchronizations.
+4. After a synchronization, run `gh workflow run check-digdir.yml --ref main-digdir`, which saves the caches that pull
+   requests restore. Nothing waits for it. Run it also after a change to a cache key lands: until then, pull requests
+   build without that cache.
 
-The release also attaches the license texts, third-party notices and the firmware's corresponding source, and refuses
-to publish while the libkrunfw commit is untagged.
+The release assets, and so the bundle digests consumers pin, are final once the first check run of the tree passes,
+before anything lands. The bundles are not byte-reproducible, so a later run of the same tree, such as the one in step
+4, has other digests, and the release takes the oldest. The firmware's corresponding source is named by its libkrunfw
+commit, so that the assets don't depend on whether libkrunfw is tagged yet. The release notes name its tag.
 
-A failed or partial release is not repaired; publish a new Digdir revision. After publishing, verify the checksums and
-the Linux glibc baseline, and record the bundle digests for consumers.
+The release refuses, without creating anything, when the libkrunfw commit is untagged or no check run built the tree.
+Tag libkrunfw, or run `gh workflow run check-digdir.yml --ref main-digdir` and wait for it to pass, then run
+`gh workflow run release-digdir.yml --ref main-digdir` to release the same version. A published release is not
+repaired. Publish a new Digdir revision instead. After publishing, verify the checksums and the Linux glibc baseline.
 
 ## Updating consumers
 
