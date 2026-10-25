@@ -543,6 +543,9 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # The trigger returns before udev has applied the rule.
+          sudo udevadm settle
+          ls -l /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
 
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
@@ -674,6 +677,9 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # The trigger returns before udev has applied the rule.
+          sudo udevadm settle
+          ls -l /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
 
       - name: Download runtime artifacts
