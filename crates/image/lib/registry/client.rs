@@ -334,25 +334,18 @@ impl Registry {
             )
             .await?;
 
-        if !force {
-            let read_cache = cache.clone();
-            let read_manifest = manifest_digest.clone();
-            let read_layers = layer_diff_ids.clone();
-            let read_platform = platform.clone();
-
-            if let Some(reference) = tokio::task::spawn_blocking(move || {
-                flat::read_current_flat_ref(
-                    &read_cache,
-                    &read_manifest,
-                    &read_layers,
-                    &read_platform,
-                )
-            })
-            .await
-            .map_err(|error| ImageError::Io(io::Error::other(error)))??
-            {
-                return Ok(reference);
-            }
+        // A hit also leases the ref and the blob it names, which journal recovery admits on
+        // their own leases.
+        if !force
+            && let (Some(reference), _flat_leases) = flat::read_current_flat_ref_leased_async(
+                &cache,
+                &manifest_digest,
+                &layer_diff_ids,
+                &platform,
+            )
+            .await?
+        {
+            return Ok(reference);
         }
 
         let (derivation_digest, derivation_bytes) =
@@ -1696,12 +1689,20 @@ fn resolve_cached_pull_result_for_platform(
     {
         return Ok(None);
     }
-    if options.materialization.includes_flat()
-        && flat::read_current_flat_ref(cache, &manifest_digest, &cached_diff_ids, platform)?
-            .is_none()
-    {
-        return Ok(None);
-    }
+    let _flat_lease = if options.materialization.includes_flat() {
+        let (reference, leases) = flat::read_current_flat_ref_leased(
+            cache,
+            &manifest_digest,
+            &cached_diff_ids,
+            platform,
+        )?;
+        if reference.is_none() {
+            return Ok(None);
+        }
+        leases
+    } else {
+        Vec::new()
+    };
 
     let result = match cached_pull_result(&metadata) {
         Ok(result) => result,
@@ -1848,12 +1849,21 @@ async fn resolve_cached_metadata_pull_result_async(
     {
         return Ok(None);
     }
-    if materialization.includes_flat()
-        && flat::read_current_flat_ref(cache, &manifest_digest, &cached_diff_ids, platform)?
-            .is_none()
-    {
-        return Ok(None);
-    }
+    let _flat_lease = if materialization.includes_flat() {
+        let (reference, leases) = flat::read_current_flat_ref_leased_async(
+            cache,
+            &manifest_digest,
+            &cached_diff_ids,
+            platform,
+        )
+        .await?;
+        if reference.is_none() {
+            return Ok(None);
+        }
+        leases
+    } else {
+        Vec::new()
+    };
 
     let result = match cached_pull_result(&metadata) {
         Ok(result) => result,
@@ -1919,6 +1929,7 @@ mod tests {
         error::ImageError,
         ext4::EXT4_ROOTFS_MATERIALIZER_ABI,
         pull::{PullOptions, PullPolicy, RootfsMaterialization},
+        storage_lease::StorageLease,
         tree::{
             FileData, FileTree, InodeMetadata, RegularFileId, RegularFileNode, TreeNode, Xattr,
         },
@@ -2421,6 +2432,63 @@ mod tests {
             "layered still requires EROFS, fsmeta, and VMDK"
         );
         assert!(all.is_none(), "all requires both representations");
+    }
+
+    #[tokio::test]
+    async fn test_flat_publication_and_cache_hits_lease_ref_and_blob_through_the_operation() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference =
+            "docker.io/library/shared-base:flat".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+        let diff_id = parse_digest(&metadata.layers[0].diff_id);
+        write_valid_erofs_layer(&cache, &diff_id, b"shared flat contents");
+        let manifest_digest = parse_digest(&metadata.manifest_digest);
+        // Journal recovery admits a flat blob on its own lease, not through its ref.
+        let operation = cache.operation();
+        let root = super::Registry::new(Platform::default(), operation.clone())
+            .unwrap()
+            .materialize_flat_rootfs(&manifest_digest, std::slice::from_ref(&diff_id), false)
+            .await
+            .unwrap();
+        let entries = [
+            cache.flat_ref_path(&manifest_digest),
+            cache.flat_blob_path(&parse_digest(&root.artifact_digest)),
+        ];
+        for path in &entries {
+            assert!(StorageLease::try_exclusive(path).unwrap().is_none());
+        }
+        drop(operation);
+
+        let operation = cache.operation();
+        let hit = resolve_cached_pull_result(
+            &operation,
+            &reference,
+            &PullOptions {
+                materialization: RootfsMaterialization::Flat,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(hit.is_some());
+        for path in &entries {
+            assert!(StorageLease::try_exclusive(path).unwrap().is_none());
+        }
+        drop(operation);
+
+        let operation = cache.operation();
+        let hit = resolve_cached_metadata_pull_result_async(
+            &operation,
+            metadata,
+            RootfsMaterialization::Flat,
+            &Platform::host_linux(),
+        )
+        .await
+        .unwrap();
+        assert!(hit.is_some());
+        for path in &entries {
+            assert!(StorageLease::try_exclusive(path).unwrap().is_none());
+        }
     }
 
     #[tokio::test]

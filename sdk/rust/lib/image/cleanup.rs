@@ -34,6 +34,18 @@ struct Cleanup {
     skipped: HashSet<PathBuf>,
     /// Metadata generations read under exclusive claims, outside the writer transaction.
     metadata_digests: HashMap<PathBuf, Option<String>>,
+    /// Each claimed manifest's flat entries, read outside the writer transaction.
+    flat: HashMap<i32, FlatClaim>,
+    /// Claimed flat blobs that no ref names, which prune removes without a catalog owner.
+    unnamed_blobs: Vec<PathBuf>,
+}
+
+/// A claimed manifest's flat ref, the blob it names, and whether the claim includes that blob.
+#[derive(Clone)]
+struct FlatClaim {
+    reference: PathBuf,
+    blob: Option<PathBuf>,
+    claims_blob: bool,
 }
 
 /// Advisory catalog snapshot used only to choose bounded preparation candidates.
@@ -246,6 +258,75 @@ impl Cleanup {
         Ok(true)
     }
 
+    /// Claim a manifest's entries with `flat_paths`, its flat ref and, unless a ref this batch
+    /// keeps names it too, the blob that ref names, as read before the claims.
+    ///
+    /// The ref may have been replaced, or another ref may have come to name the blob, since that
+    /// read. Publishers lease a ref and the blob it names before writing the ref, so the ref
+    /// cannot change once it is claimed, nor the blob's names once the blob is: read each again
+    /// only under its claim.
+    fn claim_manifest(
+        &mut self,
+        cache: &GlobalCache,
+        digest: &Digest,
+        flat_paths: Vec<PathBuf>,
+        report: &mut ImagePruneReport,
+    ) -> MicrosandboxResult<Option<FlatClaim>> {
+        let reference = cache.flat_ref_path(digest);
+        let read_blob = flat_paths.iter().find(|path| **path != reference).cloned();
+        let mut paths = vec![cache.fsmeta_erofs_path(digest), cache.vmdk_path(digest)];
+        paths.extend(flat_paths);
+        let added = paths
+            .iter()
+            .filter(|path| !self.leases.contains_key(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut added = added;
+        if !self.claim(paths, report)? {
+            return Ok(None);
+        }
+
+        // A blob the ref came to name after the read is claimed now, before its names are read.
+        // A busy one stays, and once no ref names it, a later prune reclaims it.
+        let blob = cache.flat_ref_blob_path(digest)?;
+        let blob_claimed = match &blob {
+            Some(blob) if self.leases.contains_key(blob) => true,
+            Some(blob) => {
+                let claimed = self.claim(vec![blob.clone()], report)?;
+                if claimed {
+                    added.push(blob.clone());
+                }
+                claimed
+            }
+            None => false,
+        };
+        let deleting = self.files.iter().cloned().collect();
+        let claims_blob = match &blob {
+            Some(blob) if blob_claimed => !cache.named_flat_blob_paths(&deleting)?.contains(blob),
+            _ => false,
+        };
+
+        // Give up the blobs this claim acquired but does not remove.
+        let removed_blob = blob.clone().filter(|_| claims_blob);
+        for candidate in [read_blob, blob.clone()].into_iter().flatten() {
+            if removed_blob.as_ref() != Some(&candidate) && added.contains(&candidate) {
+                self.release(&candidate);
+            }
+        }
+
+        Ok(Some(FlatClaim {
+            reference,
+            blob,
+            claims_blob,
+        }))
+    }
+
+    /// Give up an entry this batch claimed but no longer removes.
+    fn release(&mut self, path: &PathBuf) {
+        self.leases.remove(path);
+        self.files.retain(|candidate| candidate != path);
+    }
+
     /// The transaction may select existing claims, but must never acquire new ones or do I/O.
     fn select(&mut self, paths: Vec<PathBuf>) -> bool {
         if paths.iter().any(|path| self.skipped.contains(path)) {
@@ -408,6 +489,7 @@ impl Cleanup {
         scope: &CleanupScope,
         report: &mut ImagePruneReport,
     ) -> MicrosandboxResult<()> {
+        let mut removed = HashSet::new();
         for manifest in manifest::Entity::find().all(txn).await? {
             if scope.selected.is_some() && !scope.selected_manifests.contains(&manifest.id) {
                 continue;
@@ -427,18 +509,45 @@ impl Cleanup {
             }
 
             let digest: Digest = manifest.digest.parse()?;
-            if !self.select(vec![
-                cache.fsmeta_erofs_path(&digest),
-                cache.vmdk_path(&digest),
-            ]) {
+            let mut paths = vec![cache.fsmeta_erofs_path(&digest), cache.vmdk_path(&digest)];
+            paths.extend(
+                self.flat
+                    .get(&manifest.id)
+                    .map(|claim| claim.reference.clone()),
+            );
+            if !self.select(paths) {
                 continue;
             }
 
             manifest::Entity::delete_by_id(manifest.id)
                 .exec(txn)
                 .await?;
+            removed.insert(manifest.id);
 
             report.manifests_removed += 1;
+        }
+
+        // A blob goes only with every claimed manifest whose ref names it. Preparation claimed
+        // it assuming they would all go, but the transaction may keep some of them.
+        let blobs = self
+            .flat
+            .iter()
+            .filter(|(id, claim)| claim.claims_blob && removed.contains(*id))
+            .filter_map(|(_, claim)| claim.blob.clone())
+            .collect::<Vec<_>>();
+        for blob in blobs {
+            if self
+                .flat
+                .iter()
+                .all(|(id, claim)| claim.blob.as_ref() != Some(&blob) || removed.contains(id))
+            {
+                self.select(vec![blob]);
+            }
+        }
+
+        // No catalog row owns a blob that no ref names.
+        for blob in self.unnamed_blobs.clone() {
+            self.select(vec![blob]);
         }
         Ok(())
     }
@@ -624,13 +733,39 @@ impl PreparedCleanup {
                     continue;
                 }
                 let digest: Digest = manifest.digest.parse()?;
-                if cleanup.claim(
-                    vec![cache.fsmeta_erofs_path(&digest), cache.vmdk_path(&digest)],
-                    &mut report,
-                )? {
+                let deleting = cleanup.files.iter().cloned().collect();
+                let flat_paths = cache.flat_rootfs_paths(&digest, &deleting)?;
+                if let Some(claim) =
+                    cleanup.claim_manifest(&cache, &digest, flat_paths, &mut report)?
+                {
                     claimed_manifests.insert(manifest.id);
+                    cleanup.flat.insert(manifest.id, claim);
                 }
             }
+
+            // Removals prepared concurrently can each keep a blob that the other's ref names,
+            // and a replaced ref can leave its old blob behind. No manifest leads to such a blob
+            // again, so prune reclaims every blob that no ref names. Its claim settles that no
+            // publisher is about to name it; check the names again under it.
+            if selected.is_none() {
+                let mut candidates = Vec::new();
+                for blob in cache.unnamed_flat_blob_paths()? {
+                    if !cleanup.leases.contains_key(&blob)
+                        && cleanup.claim(vec![blob.clone()], &mut report)?
+                    {
+                        candidates.push(blob);
+                    }
+                }
+                let named = cache.named_flat_blob_paths(&HashSet::new())?;
+                for blob in candidates {
+                    if named.contains(&blob) {
+                        cleanup.release(&blob);
+                    } else {
+                        cleanup.unnamed_blobs.push(blob);
+                    }
+                }
+            }
+
             let retained_layers: HashSet<_> = catalog
                 .manifest_layers
                 .iter()
@@ -740,7 +875,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use microsandbox_image::{CachedImageMetadata, CachedLayerMetadata, ImageConfig};
+    use microsandbox_image::{
+        CachedImageMetadata, CachedLayerMetadata, FlatRootfsRef, ImageConfig,
+    };
     use sea_orm::ConnectionTrait;
 
     use super::*;
@@ -786,6 +923,197 @@ mod tests {
             .await
             .unwrap();
         cache
+    }
+
+    /// Publish a flat ref for `metadata`'s manifest and the blob it names.
+    fn publish_flat(
+        cache: &GlobalCache,
+        metadata: &CachedImageMetadata,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let manifest: Digest = metadata.manifest_digest.parse().unwrap();
+        let artifact: Digest = format!("sha256:{}", "f".repeat(64)).parse().unwrap();
+        let blob = cache.flat_blob_path(&artifact);
+        std::fs::write(&blob, vec![1u8; 8192]).unwrap();
+        let reference = FlatRootfsRef {
+            schema: 1,
+            manifest_digest: metadata.manifest_digest.clone(),
+            derivation_digest: format!("sha256:{}", "e".repeat(64)),
+            artifact_digest: artifact.to_string(),
+            materializer_abi: 1,
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 8192,
+            inode_count: 2,
+            content_bytes: 0,
+        };
+        cache.write_flat_ref(&manifest, &reference).unwrap();
+        (cache.flat_ref_path(&manifest), blob)
+    }
+
+    /// A removal whose catalog transaction committed, but whose process died before it unlinked
+    /// the files it journaled.
+    async fn abandon_committed_removal(local: &LocalBackend, files: &[std::path::PathBuf]) {
+        drop(Journal::prepare(&local.cache_dir(), files).unwrap());
+        let db = local.db().await.unwrap();
+        image_ref::Entity::delete_many()
+            .exec(db.write())
+            .await
+            .unwrap();
+        manifest::Entity::delete_many()
+            .exec(db.write())
+            .await
+            .unwrap();
+        layer::Entity::delete_many().exec(db.write()).await.unwrap();
+    }
+
+    /// Rerun `test` in a child process, so that no forked sibling test retains its leases.
+    #[cfg(unix)]
+    fn run_isolated(test: &str, variable: &str) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(variable, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated {test} failed: {status}");
+    }
+
+    #[tokio::test]
+    async fn busy_flat_blob_is_skipped_by_normal_removal() {
+        #[cfg(unix)]
+        if std::env::var_os("MSB_TEST_BUSY_FLAT_BLOB").is_none() {
+            run_isolated(
+                "image::cleanup::tests::busy_flat_blob_is_skipped_by_normal_removal",
+                "MSB_TEST_BUSY_FLAT_BLOB",
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let local = local(home.path()).await;
+        let reference = "example.com/a:latest";
+        let metadata = metadata('a', 'c');
+        let cache = install(&local, reference, &metadata).await;
+        let (flat_ref, blob) = publish_flat(&cache, &metadata);
+        let operation = cache.operation();
+        operation.lease_paths(vec![blob.clone()]).unwrap();
+        // Removal untags the image but keeps the manifest whose flat root is busy.
+        let report = Image::prune_local(&local).await.unwrap();
+        assert_eq!(report.image_refs_removed, 1);
+        assert_eq!(report.manifests_removed, 0);
+        assert_eq!(report.skipped_in_use, 1);
+        assert!(flat_ref.exists());
+        assert!(blob.exists());
+        drop(operation);
+        let report = Image::prune_local(&local).await.unwrap();
+        assert_eq!(report.manifests_removed, 1);
+        assert!(!flat_ref.exists());
+        assert!(!blob.exists());
+    }
+
+    #[tokio::test]
+    async fn journal_recovery_keeps_a_leased_flat_root_until_it_is_released() {
+        #[cfg(unix)]
+        if std::env::var_os("MSB_TEST_JOURNALED_FLAT_ROOT").is_none() {
+            run_isolated(
+                "image::cleanup::tests::journal_recovery_keeps_a_leased_flat_root_until_it_is_released",
+                "MSB_TEST_JOURNALED_FLAT_ROOT",
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let local = local(home.path()).await;
+        let reference = "example.com/a:latest";
+        let metadata = metadata('a', 'c');
+        let cache = install(&local, reference, &metadata).await;
+        let (flat_ref, blob) = publish_flat(&cache, &metadata);
+        let files = [flat_ref.clone(), blob.clone()];
+        abandon_committed_removal(&local, &files).await;
+
+        // The image is imported again, reusing the files, before its catalog rows commit.
+        let operation = cache.operation();
+        operation.lease_paths(files.to_vec()).unwrap();
+        Image::prune_local(&local).await.unwrap();
+        assert!(flat_ref.exists());
+        assert!(blob.exists());
+        Image::persist(&local, reference, metadata.clone())
+            .await
+            .unwrap();
+        drop(operation);
+        Journal::recover(&local).await.unwrap();
+        assert!(flat_ref.exists());
+        assert!(blob.exists());
+
+        // Without a publisher, recovery reclaims what the committed removal journaled.
+        abandon_committed_removal(&local, &files).await;
+        Journal::recover(&local).await.unwrap();
+        assert!(!flat_ref.exists());
+        assert!(!blob.exists());
+    }
+
+    #[tokio::test]
+    async fn shared_flat_blob_stays_while_a_rechecked_owner_keeps_one_of_its_refs() {
+        use sea_orm::Set;
+
+        let home = tempfile::tempdir().unwrap();
+        let local = local(home.path()).await;
+        let kept = "example.com/a:latest";
+        let kept_metadata = metadata('a', 'c');
+        let cache = install(&local, kept, &kept_metadata).await;
+        let removed_metadata = metadata('b', 'd');
+        install(&local, "example.com/b:latest", &removed_metadata).await;
+        let (kept_ref, blob) = publish_flat(&cache, &kept_metadata);
+        let (removed_ref, same_blob) = publish_flat(&cache, &removed_metadata);
+        assert_eq!(blob, same_blob);
+        let catalog = CleanupCatalog::load(local.db().await.unwrap().read())
+            .await
+            .unwrap();
+
+        // Preparation claims the blob with the second manifest, assuming both go. An owner
+        // added after the advisory read keeps the first through the transaction's recheck.
+        let now = chrono::Utc::now().naive_utc();
+        snapshot::Entity::insert(snapshot::ActiveModel {
+            artifact_path: Set(home.path().join("saved").display().to_string()),
+            digest: Set("saved-descriptor".into()),
+            scope: Set("disk".into()),
+            state_kind: Set("file".into()),
+            image_ref: Set(kept.into()),
+            image_manifest_digest: Set(kept_metadata.manifest_digest.clone()),
+            locality: Set("embedded".into()),
+            availability: Set("available".into()),
+            migration_state: Set("current".into()),
+            created_at: Set(now),
+            indexed_at: Set(now),
+            child_count: Set(0),
+            ..Default::default()
+        })
+        .exec(local.db().await.unwrap().write())
+        .await
+        .unwrap();
+
+        let prepared = PreparedCleanup::prepare(
+            local.cache_dir(),
+            cache.clone(),
+            catalog,
+            None,
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            prepared.cleanup.files.contains(&blob),
+            "preparation should claim the shared blob"
+        );
+        let (report, _, _) = prepared
+            .commit(&local, cache.clone(), None, HashSet::new(), HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(report.manifests_removed, 1);
+        assert!(!removed_ref.exists());
+        assert!(kept_ref.exists());
+        assert!(blob.exists(), "a kept ref still names the blob");
     }
 
     #[tokio::test]
@@ -1404,5 +1732,226 @@ mod tests {
         assert!(second.is_ok(), "{second:?}");
         assert!(materializer.exists());
         assert_eq!(lock.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn manifest_claim_keeps_a_blob_that_a_ref_came_to_name_before_the_claim() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(home.path()).unwrap();
+        let removed = metadata('a', 'c');
+        let digest: Digest = removed.manifest_digest.parse().unwrap();
+        let (reference, blob) = publish_flat(&cache, &removed);
+        let flat_paths = cache.flat_rootfs_paths(&digest, &HashSet::new()).unwrap();
+        assert!(flat_paths.contains(&blob));
+
+        // Another image publishes a ref naming the same blob after preparation read the names.
+        publish_flat(&cache, &metadata('b', 'd'));
+        let mut cleanup = Cleanup::default();
+        let mut report = ImagePruneReport::default();
+        let claim = cleanup
+            .claim_manifest(&cache, &digest, flat_paths, &mut report)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(claim.blob.as_ref(), Some(&blob));
+        assert!(!claim.claims_blob);
+        assert!(cleanup.files.contains(&reference));
+        assert!(!cleanup.files.contains(&blob));
+        assert!(!cleanup.leases.contains_key(&blob));
+    }
+
+    #[test]
+    fn manifest_claim_follows_a_ref_replaced_before_the_claim() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(home.path()).unwrap();
+        let removed = metadata('a', 'c');
+        let digest: Digest = removed.manifest_digest.parse().unwrap();
+        let (_, old_blob) = publish_flat(&cache, &removed);
+        let flat_paths = cache.flat_rootfs_paths(&digest, &HashSet::new()).unwrap();
+
+        // A forced re-pull replaces the ref with one naming a new blob, and removes the old one.
+        let artifact: Digest = format!("sha256:{}", "e".repeat(64)).parse().unwrap();
+        let new_blob = cache.flat_blob_path(&artifact);
+        std::fs::write(&new_blob, vec![2u8; 8192]).unwrap();
+        let mut root = cache.read_flat_ref(&digest).unwrap().unwrap();
+        root.artifact_digest = artifact.to_string();
+        cache.write_flat_ref(&digest, &root).unwrap();
+        std::fs::remove_file(&old_blob).unwrap();
+        let mut cleanup = Cleanup::default();
+        let mut report = ImagePruneReport::default();
+        let claim = cleanup
+            .claim_manifest(&cache, &digest, flat_paths, &mut report)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(claim.blob.as_ref(), Some(&new_blob));
+        assert!(claim.claims_blob);
+        assert!(cleanup.files.contains(&new_blob));
+        assert!(cleanup.leases.contains_key(&new_blob));
+        assert!(!cleanup.files.contains(&old_blob));
+        assert!(!cleanup.leases.contains_key(&old_blob));
+    }
+
+    #[test]
+    fn manifest_claim_leaves_a_busy_blob_that_a_replaced_ref_names() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(home.path()).unwrap();
+        let removed = metadata('a', 'c');
+        let digest: Digest = removed.manifest_digest.parse().unwrap();
+        let (reference, old_blob) = publish_flat(&cache, &removed);
+        let flat_paths = cache.flat_rootfs_paths(&digest, &HashSet::new()).unwrap();
+
+        // The ref is replaced before the claim, and a reader still leases the new blob.
+        let artifact: Digest = format!("sha256:{}", "e".repeat(64)).parse().unwrap();
+        let new_blob = cache.flat_blob_path(&artifact);
+        std::fs::write(&new_blob, vec![2u8; 8192]).unwrap();
+        let mut root = cache.read_flat_ref(&digest).unwrap().unwrap();
+        root.artifact_digest = artifact.to_string();
+        cache.write_flat_ref(&digest, &root).unwrap();
+        std::fs::remove_file(&old_blob).unwrap();
+        let reader = cache.operation();
+        reader.lease_paths(vec![new_blob.clone()]).unwrap();
+        let mut cleanup = Cleanup::default();
+        let mut report = ImagePruneReport::default();
+        let claim = cleanup
+            .claim_manifest(&cache, &digest, flat_paths, &mut report)
+            .unwrap()
+            .unwrap();
+
+        assert!(!claim.claims_blob);
+        assert!(cleanup.files.contains(&reference));
+        assert!(!cleanup.files.contains(&new_blob));
+        assert!(!cleanup.leases.contains_key(&new_blob));
+        assert_eq!(report.skipped_in_use, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_reclaims_a_blob_that_concurrent_removals_each_kept() {
+        #[cfg(unix)]
+        if std::env::var_os("MSB_TEST_CONCURRENT_FLAT_REMOVALS").is_none() {
+            run_isolated(
+                "image::cleanup::tests::prune_reclaims_a_blob_that_concurrent_removals_each_kept",
+                "MSB_TEST_CONCURRENT_FLAT_REMOVALS",
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let local = local(home.path()).await;
+        let first_metadata = metadata('a', 'c');
+        let second_metadata = metadata('b', 'd');
+        let first_name = "example.com/a:latest";
+        let second_name = "example.com/b:latest";
+        let cache = install(&local, first_name, &first_metadata).await;
+        install(&local, second_name, &second_metadata).await;
+        let (first_ref, blob) = publish_flat(&cache, &first_metadata);
+        let (second_ref, _) = publish_flat(&cache, &second_metadata);
+        let first_catalog = CleanupCatalog::load(local.db().await.unwrap().read())
+            .await
+            .unwrap();
+        let second_catalog = CleanupCatalog::load(local.db().await.unwrap().read())
+            .await
+            .unwrap();
+        let manifest_id = |digest: &str| {
+            first_catalog
+                .manifests
+                .iter()
+                .find(|manifest| manifest.digest == digest)
+                .unwrap()
+                .id
+        };
+        let first_scope = HashSet::from([manifest_id(&first_metadata.manifest_digest)]);
+        let second_scope = HashSet::from([manifest_id(&second_metadata.manifest_digest)]);
+
+        // Each removal is prepared while the other's ref still names the shared blob.
+        let first = PreparedCleanup::prepare(
+            local.cache_dir(),
+            cache.clone(),
+            first_catalog,
+            Some((first_name.into(), false)),
+            first_scope.clone(),
+            HashSet::new(),
+            HashSet::new(),
+        )
+        .await
+        .unwrap();
+        let second = PreparedCleanup::prepare(
+            local.cache_dir(),
+            cache.clone(),
+            second_catalog,
+            Some((second_name.into(), false)),
+            second_scope.clone(),
+            HashSet::new(),
+            HashSet::new(),
+        )
+        .await
+        .unwrap();
+        first
+            .commit(
+                &local,
+                cache.clone(),
+                Some((first_name.into(), false)),
+                first_scope,
+                HashSet::new(),
+            )
+            .await
+            .unwrap();
+        second
+            .commit(
+                &local,
+                cache.clone(),
+                Some((second_name.into(), false)),
+                second_scope,
+                HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!first_ref.exists());
+        assert!(!second_ref.exists());
+        assert!(blob.exists());
+
+        Image::prune_local(&local).await.unwrap();
+        assert!(!blob.exists());
+    }
+
+    #[tokio::test]
+    async fn prune_reclaims_unnamed_flat_blobs_but_not_one_being_published() {
+        #[cfg(unix)]
+        if std::env::var_os("MSB_TEST_UNNAMED_FLAT_BLOBS").is_none() {
+            run_isolated(
+                "image::cleanup::tests::prune_reclaims_unnamed_flat_blobs_but_not_one_being_published",
+                "MSB_TEST_UNNAMED_FLAT_BLOBS",
+            );
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let local = local(home.path()).await;
+        let cache = GlobalCache::new(&local.cache_dir()).unwrap();
+        // A ref keeps the blob it names even without a catalog manifest.
+        let (named_ref, named_blob) = publish_flat(&cache, &metadata('a', 'c'));
+        let blob = |seed: &str| {
+            let path =
+                cache.flat_blob_path(&format!("sha256:{}", seed.repeat(64)).parse().unwrap());
+            std::fs::write(&path, vec![3u8; 8192]).unwrap();
+            path
+        };
+        let orphaned = blob("1");
+        let publishing = blob("2");
+        // A publisher leases a blob before the ref that names it exists.
+        let publisher = cache.operation();
+        publisher.lease_paths(vec![publishing.clone()]).unwrap();
+
+        let report = Image::prune_local(&local).await.unwrap();
+        assert!(!orphaned.exists());
+        assert!(publishing.exists());
+        assert_eq!(report.skipped_in_use, 1);
+        assert!(named_ref.exists());
+        assert!(named_blob.exists());
+
+        drop(publisher);
+        Image::prune_local(&local).await.unwrap();
+        assert!(!publishing.exists());
+        assert!(named_blob.exists());
     }
 }
