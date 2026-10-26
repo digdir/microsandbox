@@ -42,7 +42,8 @@ use tokio::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    ERROR_ACCESS_DENIED, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    SetHandleInformation,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
@@ -695,11 +696,6 @@ pub async fn spawn_sandbox(
 
     // Build the command.
     let mut cmd = Command::new(&msb_path);
-    #[cfg(windows)]
-    if matches!(mode, SpawnMode::Detached) {
-        let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
-        cmd.creation_flags(flags);
-    }
     cmd.args(visible);
 
     // Agentd selection is process-wide for the VMM. Forward the explicit
@@ -1021,7 +1017,42 @@ fn spawn_runtime_command(
     } else {
         None
     };
+    #[cfg(windows)]
+    if matches!(_mode, SpawnMode::Detached) {
+        return spawn_detached_windows_command(cmd);
+    }
     cmd.spawn()
+}
+
+/// Start a detached runtime outside the caller's job object when the job allows it.
+///
+/// `CreateProcess` refuses `CREATE_BREAKAWAY_FROM_JOB` with `ERROR_ACCESS_DENIED` when the caller
+/// is in a job without `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, such as `cargo test` or a sandboxed tool
+/// shell. The runtime then starts inside that job instead, and ends when the job is terminated or
+/// its last handle closes with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+#[cfg(windows)]
+fn spawn_detached_windows_command(cmd: &mut Command) -> std::io::Result<tokio::process::Child> {
+    const FLAGS: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    cmd.creation_flags(FLAGS | CREATE_BREAKAWAY_FROM_JOB);
+    let breakaway_err = match cmd.spawn() {
+        Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => err,
+        result => return result,
+    };
+    tracing::warn!(
+        error = %breakaway_err,
+        "the caller's job object does not allow breakaway; the detached sandbox process stays \
+         in that job and ends if the job is terminated or closed with kill-on-close"
+    );
+    cmd.creation_flags(FLAGS);
+    cmd.spawn().map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to start sandbox process {}: {err} (with job breakaway: {breakaway_err})",
+                cmd.as_std().get_program().to_string_lossy()
+            ),
+        )
+    })
 }
 
 fn block_writeback_policy(
@@ -3632,6 +3663,141 @@ mod tests {
         let info: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(info["pid"].as_u64(), child.id().map(u64::from));
         assert!(child.wait().await.unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detached_job_grandchild() {
+        if std::env::var_os("MSB_TEST_DETACHED_JOB_GRANDCHILD").is_some() {
+            // Outlive the assertions; closing the test job ends this process.
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_detached_job_grandchild_command() -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runtime::spawn::tests::windows_detached_job_grandchild",
+            ])
+            .env_remove("MSB_TEST_DETACHED_JOB_CHILD")
+            .stdout(std::process::Stdio::null());
+        command
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_detached_job_child() {
+        use std::io::BufRead;
+        use std::os::windows::process::CommandExt;
+
+        if std::env::var_os("MSB_TEST_DETACHED_JOB_CHILD").is_none() {
+            return;
+        }
+        // The parent assigns this process to its job before releasing it.
+        std::io::stdin()
+            .lock()
+            .read_line(&mut String::new())
+            .unwrap();
+
+        let breakaway = windows_detached_job_grandchild_command()
+            .creation_flags(
+                super::DETACHED_PROCESS
+                    | super::CREATE_NEW_PROCESS_GROUP
+                    | super::CREATE_BREAKAWAY_FROM_JOB,
+            )
+            .spawn();
+        assert_eq!(
+            breakaway.err().and_then(|err| err.raw_os_error()),
+            Some(super::ERROR_ACCESS_DENIED as i32),
+            "the test job must refuse breakaway"
+        );
+
+        let mut command = tokio::process::Command::from(windows_detached_job_grandchild_command());
+        command.env("MSB_TEST_DETACHED_JOB_GRANDCHILD", "1");
+        let child =
+            super::spawn_runtime_command(&mut command, super::SpawnMode::Detached, None).unwrap();
+        println!("grandchild-pid={}", child.id().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detached_spawn_stays_in_job_without_breakaway() {
+        use std::io::{BufRead, Write};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // A kill-on-close job without JOB_OBJECT_LIMIT_BREAKAWAY_OK, like `cargo test` uses.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!job.is_null());
+        let job = unsafe { OwnedHandle::from_raw_handle(job) };
+        let mut limits = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        assert_ne!(
+            unsafe {
+                SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            },
+            0
+        );
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::spawn::tests::windows_detached_job_child",
+                "--nocapture",
+            ])
+            .env("MSB_TEST_DETACHED_JOB_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let assigned =
+            unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) };
+        if assigned == 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = child.kill();
+            panic!("assign the test child to its job: {err}");
+        }
+        child.stdin.take().unwrap().write_all(b"\n").unwrap();
+
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut lines = Vec::new();
+        let mut grandchild_pid = None;
+        for line in stdout.lines() {
+            let line = line.unwrap();
+            if let Some(pid) = line.strip_prefix("grandchild-pid=") {
+                grandchild_pid = Some(pid.parse::<u32>().unwrap());
+            }
+            lines.push(line);
+        }
+        assert!(child.wait().unwrap().success(), "{}", lines.join("\n"));
+        let grandchild_pid = grandchild_pid.expect("detached spawn reported no process");
+
+        // The fallback leaves the detached process in the job, which closing the job ends.
+        let grandchild =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, grandchild_pid) };
+        assert!(!grandchild.is_null());
+        let grandchild = unsafe { OwnedHandle::from_raw_handle(grandchild) };
+        let mut in_job = 0;
+        assert_ne!(
+            unsafe { IsProcessInJob(grandchild.as_raw_handle(), job.as_raw_handle(), &mut in_job) },
+            0
+        );
+        assert_ne!(in_job, 0);
     }
 
     #[cfg(windows)]
