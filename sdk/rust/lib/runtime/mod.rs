@@ -47,6 +47,21 @@ pub fn agent_socket_path(name: &str) -> crate::MicrosandboxResult<std::path::Pat
     resolve_agent_socket_path(name)
 }
 
+/// Check that the runtime `global` selects can expose hardware virtualization to a sandbox on
+/// this host, as [`SandboxBuilder::nested_virt`](crate::sandbox::SandboxBuilder::nested_virt)
+/// needs. The installed runtime answers, as it does when a sandbox with nesting starts.
+///
+/// # Errors
+///
+/// [`RuntimeNotInstalled`](crate::MicrosandboxError::RuntimeNotInstalled) when no runtime is
+/// installed, [`Unsupported`](crate::MicrosandboxError::Unsupported) when the host or backend
+/// cannot nest, and a runtime error when the runtime predates the nesting policy.
+pub async fn nested_virt_host_support(
+    global: &crate::config::GlobalConfig,
+) -> crate::MicrosandboxResult<()> {
+    launch_contract::nested_virt_host_support(global).await
+}
+
 /// Return whether both canonical Unix socket endpoints fit the host limit.
 #[cfg(unix)]
 pub fn run_directory_fits(run_dir: &std::path::Path) -> bool {

@@ -111,6 +111,17 @@ impl SandboxModificationBuilder {
         self
     }
 
+    /// Expose or hide hardware virtualization in the guest, like
+    /// [`SandboxBuilder::nested_virt`](crate::sandbox::SandboxBuilder::nested_virt).
+    ///
+    /// The setting is fixed at boot, so a running sandbox needs `restart` or `next_start`.
+    /// Enabling it fails before anything changes when the host or runtime cannot honor it;
+    /// disabling it always works. Local sandboxes only.
+    pub fn nested_virt(mut self, enabled: bool) -> Self {
+        self.patch.nested_virt = Some(enabled);
+        self
+    }
+
     /// Set an environment variable for future execs.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.patch.env.push(EnvVar::new(key, value));

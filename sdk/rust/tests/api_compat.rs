@@ -42,6 +42,8 @@ fn rust_config_and_runtime_setup_surface_stays_available() {
     let _ = microsandbox::config::resolve_libkrunfw_path;
     let _ = microsandbox::config::GlobalConfig::resolve_msb_path;
     let _ = microsandbox::config::GlobalConfig::resolve_libkrunfw_path;
+    let _ = microsandbox::runtime::nested_virt_host_support;
+    let _ = microsandbox::SandboxModificationBuilder::nested_virt;
 
     #[allow(deprecated)]
     let _: Option<microsandbox::config::LocalConfig> = None;

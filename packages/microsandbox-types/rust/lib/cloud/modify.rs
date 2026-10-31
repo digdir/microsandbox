@@ -508,6 +508,7 @@ fn project_secrets(
         memory_mib,
         max_memory_mib,
         root_disk_size_mib,
+        nested_virt,
         env,
         env_remove,
         labels,
@@ -533,6 +534,9 @@ fn project_secrets(
     }
     if root_disk_size_mib.is_some() {
         return unsupported("root_disk_size_mib");
+    }
+    if nested_virt.is_some() {
+        return unsupported("nested_virt");
     }
     if !env.is_empty() {
         return unsupported("env");
@@ -1226,6 +1230,13 @@ mod tests {
                 "root_disk_size_mib",
                 SandboxModificationPatch {
                     root_disk_size_mib: Some(2048),
+                    ..base()
+                },
+            ),
+            (
+                "nested_virt",
+                SandboxModificationPatch {
+                    nested_virt: Some(true),
                     ..base()
                 },
             ),

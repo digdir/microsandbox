@@ -2256,6 +2256,25 @@ Set the desired boot-time maximum hotpluggable memory in MiB. Same as [`max_memo
   </div>
 </div>
 
+#### <span className="msb-recv">modification.</span><span className="msb-hn">nested_virt()</span>
+
+<Tooltip tip="Not accepted on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn nested_virt(self, enabled: bool) -> Self
+```
+
+Expose or hide hardware virtualization in the guest at its next boot, like [`nested_virt()`](#nested-virtualization) at creation. A running sandbox needs `.restart()` or `.next_start()`. Enabling fails before anything is stopped or saved when the host or runtime cannot honor it; disabling always works. `microsandbox::runtime::nested_virt_host_support(config)` checks the host first.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>enabled</code><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc">Whether the guest gets `/dev/kvm` (or EL2 on macOS).</div>
+  </div>
+</div>
+
 #### <span className="msb-recv">modification.</span><span className="msb-hn">next_start()</span>
 
 ```rust
