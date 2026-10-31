@@ -57,6 +57,9 @@ const ROOT_DISK_FIELD: &str = "root_disk_size";
 const ENV_FIELD: &str = "env";
 const LABEL_FIELD: &str = "label";
 const WORKDIR_FIELD: &str = "workdir";
+const NESTED_VIRT_FIELD: &str = "nested_virt";
+const NESTED_VIRT_REQUIRES_RESTART: &str =
+    "nested virtualization is fixed at boot; use restart or next_start";
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -131,6 +134,7 @@ impl SandboxConfig {
             memory_mib,
             max_memory_mib,
             root_disk_size_mib,
+            nested_virt,
             env,
             env_remove,
             labels,
@@ -147,6 +151,8 @@ impl SandboxConfig {
         let spec = &mut result.spec;
         spec.resources.cpus = *cpus;
         spec.resources.memory_mib = *memory_mib;
+        // Explicit, a disable included, so it supersedes an enable saved at create.
+        spec.resources.nested_virt = nested_virt.map(Some);
         spec.runtime.workdir = workdir.clone().map(Some);
 
         // Keep a previously explicit maximum in sync when resizing raises it.
@@ -443,7 +449,12 @@ pub(super) async fn apply(
         // example HTTP CONNECT proxy authentication) is only discovered by
         // the start that follows `stop`, which leaves the workload down and
         // the rejected change already persisted.
-        if restart_required && let Some(local) = builder.backend.as_local() {
+        //
+        // Enabling nesting is checked the same way when it only applies at the next start,
+        // so a host or runtime that cannot honor it refuses the change instead of that start.
+        if (restart_required || enables_nested_virt(&config, &builder.patch))
+            && let Some(local) = builder.backend.as_local()
+        {
             crate::runtime::launch_contract::validate_runtime_config(&prospective, local.config())
                 .await?;
         }
@@ -636,6 +647,7 @@ fn build_plan(
         &mut warnings,
     );
     push_root_disk_size_change(status, config, &patch, policy, &mut changes);
+    push_nested_virt_change(status, config, &patch, policy, &mut changes);
     if live.root_disk_grow
         && running_status(status)
         && policy == ModificationPolicy::NoRestart
@@ -1885,6 +1897,34 @@ fn boot_capacity_reason(
         )),
         _ => None,
     }
+}
+
+/// Plan a change of the guest's hardware virtualization, which applies at the next boot.
+fn push_nested_virt_change(
+    status: SandboxStatus,
+    config: &SandboxConfig,
+    patch: &SandboxModificationPatch,
+    policy: ModificationPolicy,
+    changes: &mut Vec<PlannedChange>,
+) {
+    let current = config.spec.resources.nested_virt.unwrap_or(false);
+    let Some(enabled) = patch.nested_virt.filter(|enabled| *enabled != current) else {
+        return;
+    };
+    changes.push(spec_change(
+        NESTED_VIRT_FIELD,
+        ChangeKind::Updated,
+        Some(current.to_string()),
+        Some(enabled.to_string()),
+        status,
+        policy,
+        NESTED_VIRT_REQUIRES_RESTART,
+    ));
+}
+
+/// Whether applying `patch` turns on nesting that `config` does not boot with.
+fn enables_nested_virt(config: &SandboxConfig, patch: &SandboxModificationPatch) -> bool {
+    patch.nested_virt == Some(true) && config.spec.resources.nested_virt != Some(true)
 }
 
 fn spec_change(
@@ -3714,6 +3754,175 @@ mod tests {
             .unwrap();
         assert_eq!(rebuilt.spec.resources.max_cpus, 4);
         assert_eq!(rebuilt.spec.resources.max_memory_mib, 4096);
+    }
+
+    #[test]
+    fn nested_virt_changes_apply_at_boot() {
+        let patch = SandboxModificationPatch {
+            nested_virt: Some(true),
+            ..SandboxModificationPatch::default()
+        };
+        let plan_for = |status, policy| {
+            let plan = build_plan(
+                "api".to_string(),
+                status,
+                &config(2, 1024),
+                None,
+                LiveControl::default(),
+                patch.clone(),
+                policy,
+            );
+            let [PlannedChange::Config(change)] = plan.changes.as_slice() else {
+                panic!("expected one config change: {:?}", plan.changes);
+            };
+            assert_eq!(change.field, NESTED_VIRT_FIELD);
+            assert_eq!(change.before.as_deref(), Some("false"));
+            assert_eq!(change.after.as_deref(), Some("true"));
+            (change.disposition, change.reason.clone())
+        };
+
+        assert_eq!(
+            plan_for(SandboxStatus::Stopped, ModificationPolicy::NoRestart),
+            (ModificationDisposition::NextStart, None)
+        );
+        assert_eq!(
+            plan_for(SandboxStatus::Running, ModificationPolicy::NextStart),
+            (ModificationDisposition::NextStart, None)
+        );
+        assert_eq!(
+            plan_for(SandboxStatus::Running, ModificationPolicy::NoRestart),
+            (
+                ModificationDisposition::RequiresRestart,
+                Some(NESTED_VIRT_REQUIRES_RESTART.to_string())
+            )
+        );
+
+        // Requesting the effective value plans nothing; an unset policy boots without nesting.
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config(2, 1024),
+            None,
+            LiveControl::default(),
+            SandboxModificationPatch {
+                nested_virt: Some(false),
+                ..SandboxModificationPatch::default()
+            },
+            ModificationPolicy::NoRestart,
+        );
+        assert!(plan.changes.is_empty());
+    }
+
+    #[test]
+    fn rebuild_keeps_nested_virt_disabled_by_modify() {
+        let created = crate::sandbox::SandboxBuilder::new("nested-rebuild")
+            .image("alpine")
+            .nested_virt(true)
+            .finish(None, None)
+            .unwrap();
+        assert_eq!(created.spec.resources.nested_virt, Some(true));
+        let mut modified = created;
+        modified.apply_modification(&SandboxModificationPatch {
+            nested_virt: Some(false),
+            ..SandboxModificationPatch::default()
+        });
+        assert_eq!(modified.spec.resources.nested_virt, Some(false));
+        let overrides = modified.caller_config_overrides.as_deref().unwrap();
+        assert_eq!(overrides.spec.resources.nested_virt, Some(Some(false)));
+
+        let json = serde_json::to_string(&modified).unwrap();
+        let saved = modified.caller_config_overrides_json(&json).unwrap();
+        let loaded = SandboxConfig::from_stored(&json, saved.as_deref()).unwrap();
+        let rebuilt = crate::sandbox::SandboxBuilder::from(loaded)
+            .finish(None, None)
+            .unwrap();
+        assert_eq!(
+            rebuilt.spec.resources.nested_virt,
+            Some(false),
+            "a rebuild must not replay the enable saved at create"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_nested_virt_is_checked_before_it_is_persisted() {
+        let temp = tempdir().unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(
+            LocalBackend::builder()
+                .config_path(temp.path().join("config.json"))
+                .managed_config_path(temp.path().join("managed.json"))
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.as_local().unwrap().db().await.unwrap();
+        let current = config(2, 1024);
+        let model = sandbox_entity::ActiveModel {
+            name: Set(current.spec.name.clone()),
+            config: Set(serde_json::to_string(&current).unwrap()),
+            active_config: Set(None),
+            status: Set(SandboxStatus::Stopped),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(pools.write())
+        .await
+        .unwrap();
+        let saved = || async {
+            let row = sandbox_entity::Entity::find_by_id(model.id)
+                .one(pools.read())
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<SandboxConfig>(&row.config)
+                .unwrap()
+                .spec
+                .resources
+                .nested_virt
+        };
+
+        // Without a runtime that confirms host support, the next start could not honor the
+        // change: it is refused, and nothing is saved. Enabling installs an embedded runtime
+        // first, so the host is asked afterwards.
+        let enabled = SandboxModificationBuilder::new(backend.clone(), &current.spec.name)
+            .nested_virt(true)
+            .apply()
+            .await;
+        let local = backend.as_local().unwrap();
+        match crate::runtime::nested_virt_host_support(local.config()).await {
+            Ok(()) => {
+                assert!(enabled.unwrap().applied);
+                assert_eq!(saved().await, Some(true));
+            }
+            Err(_) => {
+                enabled.expect_err("enabling must be checked against the runtime");
+                assert_eq!(
+                    saved().await,
+                    None,
+                    "a refused change must not be persisted"
+                );
+            }
+        }
+
+        // Disabling needs no host support, so a host that lost it can still recover.
+        let mut nested = current.clone();
+        nested.spec.resources.nested_virt = Some(true);
+        sandbox_entity::Entity::update_many()
+            .col_expr(
+                sandbox_entity::Column::Config,
+                Expr::value(serde_json::to_string(&nested).unwrap()),
+            )
+            .filter(sandbox_entity::Column::Id.eq(model.id))
+            .exec(pools.write())
+            .await
+            .unwrap();
+        let disabled = SandboxModificationBuilder::new(backend.clone(), &current.spec.name)
+            .nested_virt(false)
+            .apply()
+            .await
+            .unwrap();
+        assert!(disabled.applied);
+        assert_eq!(saved().await, Some(false));
     }
 
     #[test]

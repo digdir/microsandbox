@@ -814,6 +814,12 @@ pub(crate) async fn validate_nested_virt(
     )))
 }
 
+/// Ask the runtime `global` selects whether this host can nest, as a start with nesting does.
+pub(crate) async fn nested_virt_host_support(global: &GlobalConfig) -> MicrosandboxResult<()> {
+    let runtime = crate::setup::resolve_runtime(global)?;
+    validate_nested_host(capabilities(&runtime.msb_path).await?.as_ref())
+}
+
 fn validate_nested_host(capabilities: &LaunchCapabilities) -> MicrosandboxResult<()> {
     if !capabilities.protocols.contains(&2) || capabilities.nested_virt.is_none() {
         return Err(MicrosandboxError::Runtime(upgrade_required(
