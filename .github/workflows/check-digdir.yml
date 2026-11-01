@@ -370,8 +370,11 @@ jobs:
   build-macos:
     name: Build runtime (darwin-aarch64)
     needs: [validate, build-kernel, build-agentd]
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
+    env:
+      # The macOS 14 runner image is retired; keep the runtime loadable on macOS 14.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -518,7 +521,7 @@ jobs:
             os: linux
             agentd_target: aarch64-unknown-linux-musl
           - target: darwin-aarch64
-            runner: macos-14
+            runner: macos-15
             os: darwin
             agentd_target: ""
     uses: ./.github/workflows/test-platform-digdir.yml
