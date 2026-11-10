@@ -127,7 +127,9 @@ pub enum NetworkOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
         /// Whether the Sandbox's own DNS resolved `hostname` to the destination
-        /// address, in an answer whose TTL has not expired. The Sandbox chooses
+        /// address, in an answer within its TTL or the last five minutes,
+        /// whichever is longer, since clients keep addresses past short TTLs.
+        /// The Sandbox chooses
         /// the hostname it sends, such as its TLS SNI or HTTP `Host`, so a host
         /// controller that admits flows by hostname can require this to refuse a
         /// name claimed for an address that DNS never gave for it. Answers from
