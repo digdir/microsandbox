@@ -455,7 +455,13 @@ impl DnsForwarder {
                     tracing::debug!(domain = %domain, "DNS binding capacity exceeded");
                     return build_status_response(&query_msg, ResponseCode::ServFail);
                 }
-            } else {
+            } else if matches!(
+                response_msg.metadata.response_code,
+                ResponseCode::NoError | ResponseCode::NXDomain
+            ) {
+                // Only an answer that the name has no such addresses ends
+                // earlier bindings. A failed lookup, such as SERVFAIL, says
+                // nothing about them, and they stay live until their TTL.
                 self.shared.clear_resolved_hostname(&domain, family);
             }
         }
@@ -1599,6 +1605,51 @@ mod tests {
             resolve_via_gateway(&forwarder).await,
             Some(Ipv4Addr::new(203, 0, 113, 5))
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_keeps_live_addresses_and_a_negative_answer_ends_them() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = socket.local_addr().unwrap();
+        let address = Ipv4Addr::new(93, 184, 216, 1);
+        let server = tokio::spawn(async move {
+            let mut buf = [0; 4096];
+            for code in [
+                ResponseCode::NoError,
+                ResponseCode::ServFail,
+                ResponseCode::NXDomain,
+            ] {
+                let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+                let query = Message::from_bytes(&buf[..len]).unwrap();
+                let mut response = make_response(&query);
+                response.metadata.response_code = code;
+                if code == ResponseCode::NoError {
+                    response.add_answer(Record::from_rdata(
+                        query.queries[0].name().clone(),
+                        60,
+                        RData::A(A::from(address)),
+                    ));
+                }
+                socket
+                    .send_to(&response.to_bytes().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let forwarder = forwarder_over(&[upstream]).await;
+        let bound = || {
+            forwarder
+                .shared
+                .any_resolved_hostname(address.into(), |host| host == "example.com")
+        };
+
+        assert_eq!(resolve_via_gateway(&forwarder).await, Some(address));
+        assert!(bound());
+        resolve_via_gateway(&forwarder).await;
+        assert!(bound(), "SERVFAIL must not end an answer whose TTL is live");
+        resolve_via_gateway(&forwarder).await;
+        assert!(!bound(), "NXDOMAIN ends it");
+        server.await.unwrap();
     }
 
     #[tokio::test]
