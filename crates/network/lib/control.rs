@@ -126,6 +126,15 @@ pub enum NetworkOperation {
         /// Host name established by trusted protocol inspection, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        /// Whether the Sandbox's own DNS resolved `hostname` to the destination
+        /// address, in an answer whose TTL has not expired. The Sandbox chooses
+        /// the hostname it sends, such as its TLS SNI or HTTP `Host`, so a host
+        /// controller that admits flows by hostname can require this to refuse a
+        /// name claimed for an address that DNS never gave for it. Answers from
+        /// a resolver the Sandbox selects count too, so such a controller must
+        /// also refuse [`NetworkOperation::DnsQuery`] operations that name one.
+        #[serde(default)]
+        hostname_resolved: bool,
         /// Whether the destination was rewritten to host loopback because it is
         /// gateway-bound. A fail-closed host controller uses this to hold
         /// host-destined flows to its trusted endpoint instead of guessing which
@@ -1343,6 +1352,7 @@ mod tests {
             destination: destination.parse().unwrap(),
             transport: TransportProtocol::Tcp,
             hostname: None,
+            hostname_resolved: false,
             destination_is_host: false,
         }
     }
@@ -1671,6 +1681,7 @@ mod tests {
                     destination: "198.51.100.10:443".parse().unwrap(),
                     transport: TransportProtocol::Tcp,
                     hostname: None,
+                    hostname_resolved: false,
                     destination_is_host: false,
                 })
                 .await
@@ -1692,6 +1703,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_connect_without_hostname_resolved_reads_as_unresolved() {
+        let operation: NetworkOperation = serde_json::from_str(
+            r#"{"operation":"connect","source":null,"destination":"198.51.100.10:443","transport":"tcp","hostname":"example.com"}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            operation,
+            NetworkOperation::Connect {
+                hostname_resolved: false,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn bounded_framing_round_trips_protocol_messages() {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
@@ -1703,6 +1730,7 @@ mod tests {
                 destination: "198.51.100.10:443".parse().unwrap(),
                 transport: TransportProtocol::Tcp,
                 hostname: Some("example.com".to_string()),
+                hostname_resolved: true,
                 destination_is_host: false,
             },
         };

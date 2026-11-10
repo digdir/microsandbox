@@ -308,6 +308,12 @@ impl SharedState {
             .member_matches(&addr, Instant::now(), |key| predicate(&key.hostname))
     }
 
+    /// Returns `true` when a live answer resolved `hostname` to `addr`.
+    pub fn hostname_resolves_to(&self, hostname: &str, addr: IpAddr) -> bool {
+        let hostname = normalize_hostname(hostname);
+        self.any_resolved_hostname(addr, |cached| cached == hostname)
+    }
+
     /// Best-effort expiry maintenance for resolved hostnames.
     ///
     /// This runs outside the hot egress read path. If the index is currently

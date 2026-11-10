@@ -373,12 +373,16 @@ impl TcpProxy {
         // authorized destination.
         let mut control_grant = match controller.as_ref() {
             Some(controller) => {
+                let hostname_resolved = control_hostname
+                    .as_deref()
+                    .is_some_and(|hostname| shared.hostname_resolves_to(hostname, guest_dst.ip()));
                 match controller
                     .authorize(NetworkOperation::Connect {
                         source: None,
                         destination: guest_dst,
                         transport: TransportProtocol::Tcp,
                         hostname: control_hostname,
+                        hostname_resolved,
                         destination_is_host: is_host_destined(guest_dst, connect_target.primary()),
                     })
                     .await
@@ -1872,6 +1876,22 @@ pub(crate) mod tests {
         controller: &crate::control::test_support::TestController,
         outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     ) -> (TcpProxy, Arc<ProxyConnectState>) {
+        controlled_proxy_sharing(
+            guest_dst,
+            request,
+            controller,
+            outbound_proxy,
+            Arc::new(SharedState::new(4)),
+        )
+    }
+
+    fn controlled_proxy_sharing(
+        guest_dst: SocketAddr,
+        request: &[u8],
+        controller: &crate::control::test_support::TestController,
+        outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+        shared: Arc<SharedState>,
+    ) -> (TcpProxy, Arc<ProxyConnectState>) {
         let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
         let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
         from_tx.try_send(Bytes::copy_from_slice(request)).unwrap();
@@ -1884,7 +1904,7 @@ pub(crate) mod tests {
             UpstreamTcpTarget::direct(guest_dst),
             from_rx,
             to_tx,
-            Arc::new(SharedState::new(4)),
+            shared,
             Arc::new(NetworkPolicy::allow_all()),
             Arc::new(SecretsConfig::default()),
             None,
@@ -1894,6 +1914,50 @@ pub(crate) mod tests {
         )
         .with_controller(Some(controller.client()));
         (proxy, proxy_connect)
+    }
+
+    #[tokio::test]
+    async fn controlled_tcp_reports_whether_dns_resolved_the_hostname_to_the_destination() {
+        use crate::control::test_support::{TestController, TestDecision};
+        use crate::netstack::shared::ResolvedHostnameFamily;
+
+        for (resolved_to, expected) in [
+            (None, false),
+            (Some("other.example.com"), false),
+            (Some("API.example.com."), true),
+        ] {
+            let controller = TestController::start(TestDecision::Deny).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let guest_dst = listener.local_addr().unwrap();
+            let shared = Arc::new(SharedState::new(4));
+            if let Some(domain) = resolved_to {
+                assert!(shared.cache_resolved_hostname(
+                    domain,
+                    ResolvedHostnameFamily::Ipv4,
+                    [guest_dst.ip()],
+                    Duration::from_secs(60),
+                ));
+            }
+            let (proxy, _) = controlled_proxy_sharing(
+                guest_dst,
+                b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                &controller,
+                None,
+                shared,
+            );
+
+            proxy.try_run().await.unwrap();
+
+            let operations = controller.wait_for_operations(1).await;
+            assert!(
+                matches!(
+                    &operations[0],
+                    NetworkOperation::Connect { hostname: Some(hostname), hostname_resolved, .. }
+                        if hostname == "api.example.com" && *hostname_resolved == expected
+                ),
+                "resolved to {resolved_to:?}: {operations:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2073,6 +2137,7 @@ pub(crate) mod tests {
                     destination: proxy_addr,
                     transport: TransportProtocol::Tcp,
                     hostname: None,
+                    hostname_resolved: false,
                     destination_is_host: false,
                 })
                 .await
