@@ -282,6 +282,8 @@ impl TlsProxy {
                     destination: guest_dst,
                     transport: TransportProtocol::Tcp,
                     hostname: has_sni.then(|| sni_name.clone()),
+                    hostname_resolved: has_sni
+                        && shared.hostname_resolves_to(&sni_name, guest_dst.ip()),
                     destination_is_host: is_host_destined(guest_dst, connect_dst),
                 })
                 .await

@@ -355,6 +355,7 @@ impl UdpRelay {
                             destination: guest_dst,
                             transport: TransportProtocol::Udp,
                             hostname: None,
+                            hostname_resolved: false,
                             destination_is_host: is_host_destined(guest_dst, host_dst),
                         })
                         .await
