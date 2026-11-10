@@ -37,6 +37,11 @@ pub(crate) const MAX_RESOLVED_HOSTNAME_BINDINGS: usize = 16_384;
 /// Maximum live bindings for one normalized hostname, across both families.
 pub(crate) const MAX_BINDINGS_PER_HOSTNAME: usize = 1_024;
 
+/// How long an answer counts towards [`SharedState::hostname_resolves_to`] at least, however
+/// short its TTL. Clients keep addresses past short TTLs, such as Bun for 30 seconds and the JVM
+/// and connection pools for longer, and refusing their connections would fail them at random.
+pub(crate) const RESOLVED_HOSTNAME_MIN_LIFETIME: Duration = Duration::from_secs(300);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -80,6 +85,11 @@ pub struct SharedState {
 
     /// Resolved hostname index used to map destination IPs back to queried hostnames.
     resolved_hostnames: RwLock<TtlReverseIndex<ResolvedHostnameKey, IpAddr>>,
+
+    /// The same answers, each kept for at least [`RESOLVED_HOSTNAME_MIN_LIFETIME`], for
+    /// [`SharedState::hostname_resolves_to`] only, so domain rules keep to the TTLs. Taken after
+    /// `resolved_hostnames` whenever both are, which they are to change either.
+    recently_resolved_hostnames: RwLock<TtlReverseIndex<ResolvedHostnameKey, IpAddr>>,
 
     /// Per-sandbox gateway IPv4. Set once at boot; used by
     /// `DestinationGroup::Host` rule matching and `host.microsandbox.internal`
@@ -140,6 +150,7 @@ impl SharedState {
             proxy_wake: WakePipe::new(),
             termination_hook: Mutex::new(None),
             resolved_hostnames: RwLock::new(TtlReverseIndex::default()),
+            recently_resolved_hostnames: RwLock::new(TtlReverseIndex::default()),
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
             nat64_prefixes: OnceLock::new(),
@@ -261,38 +272,36 @@ impl SharedState {
     ) -> bool {
         let hostname = normalize_hostname(domain);
         let key = ResolvedHostnameKey { hostname, family };
-        let addrs = addrs.into_iter().map(normalize_ip_addr);
+        let addrs: Vec<IpAddr> = addrs.into_iter().map(normalize_ip_addr).collect();
 
         let now = Instant::now();
+        // Both indexes change under both locks, in this order, so a concurrent answer for the
+        // name cannot leave them disagreeing.
         let mut index = self.resolved_hostnames.write();
-        index.evict_expired(now);
-
-        let bindings_for = |family| {
-            index.member_count(&ResolvedHostnameKey {
-                hostname: key.hostname.clone(),
-                family,
-            })
-        };
-
-        let ipv4_bindings = bindings_for(ResolvedHostnameFamily::Ipv4);
-        let ipv6_bindings = bindings_for(ResolvedHostnameFamily::Ipv6);
-        let hostname_bindings = ipv4_bindings + ipv6_bindings;
-
-        let total_bindings = index.binding_count();
-        let hostname_slots = MAX_BINDINGS_PER_HOSTNAME.saturating_sub(hostname_bindings);
-        let sandbox_slots = MAX_RESOLVED_HOSTNAME_BINDINGS.saturating_sub(total_bindings);
-        let available_slots = hostname_slots.min(sandbox_slots);
-
-        // try_extend takes a total capacity; only new bindings consume slots.
-        let capacity = total_bindings + available_slots;
-        index.try_extend(key, addrs, ttl, now, capacity)
+        let mut recent = self.recently_resolved_hostnames.write();
+        if !extend_bounded(&mut index, key.clone(), addrs.iter().copied(), ttl, now) {
+            return false;
+        }
+        // Best effort: an answer it has no room for still counts while its TTL lasts.
+        extend_bounded(
+            &mut recent,
+            key,
+            addrs,
+            ttl.max(RESOLVED_HOSTNAME_MIN_LIFETIME),
+            now,
+        );
+        true
     }
 
     /// Clear the resolved addresses for a hostname within the given address family.
     pub fn clear_resolved_hostname(&self, domain: &str, family: ResolvedHostnameFamily) {
         let hostname = normalize_hostname(domain);
         let key = ResolvedHostnameKey { hostname, family };
-        self.resolved_hostnames.write().remove(&key, Instant::now());
+        let now = Instant::now();
+        let mut index = self.resolved_hostnames.write();
+        let mut recent = self.recently_resolved_hostnames.write();
+        index.remove(&key, now);
+        recent.remove(&key, now);
     }
 
     /// Returns `true` when any resolved hostname for `addr` satisfies `predicate`.
@@ -308,10 +317,17 @@ impl SharedState {
             .member_matches(&addr, Instant::now(), |key| predicate(&key.hostname))
     }
 
-    /// Returns `true` when a live answer resolved `hostname` to `addr`.
+    /// Returns `true` when an answer resolved `hostname` to `addr` within its TTL or the last five
+    /// minutes, whichever is longer.
     pub fn hostname_resolves_to(&self, hostname: &str, addr: IpAddr) -> bool {
         let hostname = normalize_hostname(hostname);
-        self.any_resolved_hostname(addr, |cached| cached == hostname)
+        let addr = normalize_ip_addr(addr);
+        let now = Instant::now();
+        let index = self.resolved_hostnames.read();
+        let recent = self.recently_resolved_hostnames.read();
+        [&*index, &*recent]
+            .into_iter()
+            .any(|index| index.member_matches(&addr, now, |key| key.hostname == hostname))
     }
 
     /// Best-effort expiry maintenance for resolved hostnames.
@@ -319,8 +335,12 @@ impl SharedState {
     /// This runs outside the hot egress read path. If the index is currently
     /// busy, cleanup is skipped and retried on the next maintenance pass.
     pub fn cleanup_resolved_hostnames(&self) {
+        let now = Instant::now();
         if let Some(mut idx) = self.resolved_hostnames.try_write() {
-            idx.evict_expired(Instant::now());
+            idx.evict_expired(now);
+        }
+        if let Some(mut idx) = self.recently_resolved_hostnames.try_write() {
+            idx.evict_expired(now);
         }
     }
 
@@ -418,6 +438,38 @@ impl Default for NetworkMetrics {
     }
 }
 
+/// Adds `addrs` for `key` to `index` unless they would exceed the hostname or sandbox binding
+/// limit, in which case it changes nothing and returns `false`.
+fn extend_bounded(
+    index: &mut TtlReverseIndex<ResolvedHostnameKey, IpAddr>,
+    key: ResolvedHostnameKey,
+    addrs: impl IntoIterator<Item = IpAddr>,
+    ttl: Duration,
+    now: Instant,
+) -> bool {
+    index.evict_expired(now);
+
+    let bindings_for = |family| {
+        index.member_count(&ResolvedHostnameKey {
+            hostname: key.hostname.clone(),
+            family,
+        })
+    };
+
+    let ipv4_bindings = bindings_for(ResolvedHostnameFamily::Ipv4);
+    let ipv6_bindings = bindings_for(ResolvedHostnameFamily::Ipv6);
+    let hostname_bindings = ipv4_bindings + ipv6_bindings;
+
+    let total_bindings = index.binding_count();
+    let hostname_slots = MAX_BINDINGS_PER_HOSTNAME.saturating_sub(hostname_bindings);
+    let sandbox_slots = MAX_RESOLVED_HOSTNAME_BINDINGS.saturating_sub(total_bindings);
+    let available_slots = hostname_slots.min(sandbox_slots);
+
+    // try_extend takes a total capacity; only new bindings consume slots.
+    let capacity = total_bindings + available_slots;
+    index.try_extend(key, addrs, ttl, now, capacity)
+}
+
 pub(crate) fn normalize_hostname(domain: &str) -> String {
     domain.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -503,6 +555,31 @@ mod tests {
 
         assert!(!state.push_rx_frame(vec![4, 5]));
         assert_eq!(state.rx_bytes(), 3);
+    }
+
+    #[test]
+    fn an_answer_counts_as_resolved_past_a_short_ttl_but_not_for_domain_rules() {
+        let shared = SharedState::new(4);
+        let addr: IpAddr = "93.184.216.34".parse().unwrap();
+        assert!(shared.cache_resolved_hostname(
+            "Example.com.",
+            ResolvedHostnameFamily::Ipv4,
+            [addr],
+            Duration::ZERO,
+        ));
+
+        assert!(
+            !shared.any_resolved_hostname(addr, |host| host == "example.com"),
+            "domain rules keep to the TTL"
+        );
+        assert!(shared.hostname_resolves_to("example.com", addr));
+        assert!(!shared.hostname_resolves_to("other.example.com", addr));
+
+        shared.clear_resolved_hostname("example.com", ResolvedHostnameFamily::Ipv4);
+        assert!(
+            !shared.hostname_resolves_to("example.com", addr),
+            "a negative answer ends it"
+        );
     }
 
     #[test]
